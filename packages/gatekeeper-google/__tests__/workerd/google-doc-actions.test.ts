@@ -12,10 +12,14 @@ type BatchKind = "content" | "cleanup";
 
 class DocsModel {
   content = "";
+  title = "Test document";
   cleanupFailures = 0;
   ambiguousContentResponses = 0;
   contentBatches = 0;
   maxMarkerCount = 0;
+  /** Every provider request, of any kind. Provisional simulation must leave this at zero. */
+  requests = 0;
+  readonly createdTitles: string[] = [];
   readonly deletedMarkerIds: string[] = [];
   readonly markers = new Map<string, string>();
   #revision = 1;
@@ -60,6 +64,16 @@ class DocsModel {
     let url = new URL(input instanceof Request ? input.url : input.toString());
     if (url.hostname !== "docs.googleapis.com") {
       throw new Error(`Unexpected provider request: ${url}`);
+    }
+    this.requests++;
+    if (url.pathname === "/v1/documents" && init?.method === "POST") {
+      // documents.create: mints doc-1, which the model's other routes already serve.
+      let body = JSON.parse(String(init?.body)) as { title: string };
+      this.createdTitles.push(body.title);
+      this.title = body.title;
+      return Response.json({
+        documentId: "doc-1", title: body.title, revisionId: `revision-${this.#revision}`,
+      });
     }
     if (!url.pathname.endsWith(":batchUpdate")) return Response.json(this.#document());
 
@@ -134,7 +148,7 @@ class DocsModel {
     }
     return {
       documentId: "doc-1",
-      title: "Test document",
+      title: this.title,
       revisionId: `revision-${this.#revision}`,
       tabs: [{
         documentTab: {
@@ -182,7 +196,9 @@ describe("Google Doc write receipts", () => {
     expect(docs.contentBatches).toBe(1);
     expect(docs.deletedMarkerIds).toEqual(["marker-1"]);
     expect(docs.markers.size).toBe(0);
-    expect(await hooks().applyAction("normal", actionId)).toMatch(/Unknown pending/);
+    // A retry after a lost reply settles again rather than stranding the approval.
+    expect(await hooks().applyAction("normal", actionId)).toBeNull();
+    expect(docs.contentBatches).toBe(1);
   });
 
   it("reconciles a committed write after its response is lost", async () => {
@@ -199,7 +215,7 @@ describe("Google Doc write receipts", () => {
 
     expect(docs.contentBatches).toBe(1);
     expect(docs.markers.size).toBe(0);
-    expect(await hooks().applyAction("ambiguous", actionId)).toMatch(/Unknown pending/);
+    expect(await hooks().applyAction("ambiguous", actionId)).toBeNull();
   });
 
   it("cleans a retained receipt after restart before the next write", async () => {
@@ -265,7 +281,7 @@ describe("Google Doc write receipts", () => {
 
     expect(docs.contentBatches).toBe(0);
     expect(docs.markers.size).toBe(0);
-    expect(await hooks().applyAction("reject", actionId)).toMatch(/Unknown pending/);
+    expect(await hooks().applyAction("reject", actionId)).toBeNull();
   });
 
   // The overseer marks a record approved only after applyAction() returns, so a second approval of
@@ -283,7 +299,7 @@ describe("Google Doc write receipts", () => {
     write.release();
 
     expect(await first).toBeNull();
-    expect(await second).toMatch(/Unknown pending/);
+    expect(await second).toBeNull();
     expect(docs.contentBatches).toBe(1);
     expect(docs.content.match(/first/g)).toHaveLength(1);
     expect(docs.markers.size).toBe(0);
@@ -323,6 +339,110 @@ describe("Google Doc write receipts", () => {
     let content = await hooks().readContent("lost-response");
 
     expect(content.match(/first/g)).toHaveLength(1);
+  });
+});
+
+describe("Google Doc creation (createExternalResource)", () => {
+  const CREATION = { title: "My New Doc" };
+
+  it("simulates the uncreated document without touching the provider", async () => {
+    let docs = new DocsModel();
+    docs.install();
+
+    let creationId = await hooks().submitCreation("create-simulate", CREATION.title);
+    expect(creationId).toBe(1);
+    // Idempotent: a retried submitCreationAction queues nothing new.
+    expect(await hooks().submitCreation("create-simulate", CREATION.title)).toBeNull();
+
+    expect(await hooks().readContent("create-simulate", CREATION)).toBe("");
+    await hooks().submitAppend("create-simulate", "hello", CREATION);
+    expect(await hooks().readContent("create-simulate", CREATION)).toContain("hello");
+    expect(await hooks().readMetadata("create-simulate", CREATION)).toBeGreaterThan(0);
+
+    let description = await hooks().describeDoc("create-simulate", CREATION);
+    expect(description.title).toBe(CREATION.title);
+    expect(description.url).toContain("provisional-create-simulate");
+    expect(description.snippet).toContain("pending creation");
+
+    expect(docs.requests).toBe(0);
+  });
+
+  it("applies the creation first, then queued edits, against the real document", async () => {
+    let docs = new DocsModel();
+    docs.install();
+    let creationId = await hooks().submitCreation("create-apply", CREATION.title);
+    let editId = await hooks().submitAppend("create-apply", "hello", CREATION);
+
+    // In-order approval: the edit cannot apply before the creation.
+    expect(await hooks().applyAction("create-apply", editId, CREATION))
+      .toMatch(/approved in order/);
+    expect(docs.createdTitles).toEqual([]);
+
+    expect(await hooks().applyAction("create-apply", creationId!, CREATION)).toBeNull();
+    expect(docs.createdTitles).toEqual([CREATION.title]);
+
+    expect(await hooks().applyAction("create-apply", editId, CREATION)).toBeNull();
+    expect(docs.content).toContain("hello");
+
+    // The binding now describes (and reads) the real document.
+    let description = await hooks().describeDoc("create-apply", CREATION);
+    expect(description.url).toContain("doc-1");
+    expect(description.snippet).not.toContain("pending creation");
+    expect(await hooks().readContent("create-apply", CREATION)).toContain("hello");
+  });
+
+  it("does not create a second document on a retried approval", async () => {
+    let docs = new DocsModel();
+    docs.install();
+    let creationId = await hooks().submitCreation("create-retry", CREATION.title);
+
+    expect(await hooks().applyAction("create-retry", creationId!, CREATION)).toBeNull();
+    expect(await hooks().applyAction("create-retry", 99, CREATION))
+      .toMatch(/Unknown Google Doc action/);
+    expect(docs.createdTitles).toEqual([CREATION.title]);
+  });
+
+  it("rejecting the creation cascades to queued edits and kills the binding", async () => {
+    let docs = new DocsModel();
+    docs.install();
+    let creationId = await hooks().submitCreation("create-reject", CREATION.title);
+    let editId = await hooks().submitAppend("create-reject", "hello", CREATION);
+
+    expect(await hooks().rejectAction("create-reject", creationId!, CREATION)).toBe(true);
+
+    // The queued edit was invalidated: approving it settles the record without a provider call.
+    expect(await hooks().applyAction("create-reject", editId, CREATION)).toBeNull();
+    expect(docs.requests).toBe(0);
+
+    // The binding is dead, with an explanation rather than simulation against nothing.
+    expect(await hooks().readContentError("create-reject", CREATION)).toMatch(/rejected/);
+    let description = await hooks().describeDoc("create-reject", CREATION);
+    expect(description.snippet).toContain("creation rejected");
+  });
+
+  it("withholds the created document from an observer admitted before it existed", async () => {
+    let docs = new DocsModel();
+    docs.install();
+    let creationId = await hooks().submitCreation("create-observer", CREATION.title);
+
+    // Nothing exists to check an ACL against, so the collaborator is admitted unchecked.
+    expect(await hooks().addObserver("create-observer", "collab", false, CREATION)).toBeNull();
+    expect(await hooks().readContentExclusions("create-observer", CREATION)).toEqual([]);
+
+    expect(await hooks().applyAction("create-observer", creationId!, CREATION)).toBeNull();
+
+    // The first read of the real document is where that admission is settled.
+    expect(await hooks().readContentExclusions("create-observer", CREATION)).toEqual(["collab"]);
+    expect(await hooks().readContentExclusions("create-observer", CREATION)).toEqual([]);
+  });
+
+  it("checks the ACL when admitting an observer to an existing document", async () => {
+    new DocsModel().install();
+
+    expect(await hooks().addObserver("existing-observer", "collab", false))
+      .toMatch(/does not have access/);
+    expect(await hooks().addObserver("existing-observer", "collab", true)).toBeNull();
+    expect(await hooks().readContentExclusions("existing-observer")).toEqual([]);
   });
 });
 

@@ -6,7 +6,7 @@
  * `typeUrlPattern`s, and recorded grants. Never change one after deploy.
  */
 
-import type { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
+import type { ResourceCreationOptions, SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import type { CalendarAvailabilityMode } from "./calendar-types";
 import { validateGmailLabelName, validateGmailQueryForGrouping } from "./gmail-validate";
 
@@ -38,7 +38,39 @@ export const GOOGLE_DOC_RESOURCE: SupportedResource = {
   title: "Google Doc",
   description: "Read and edit documents you choose.",
   grantable: true,
+  creatable: {
+    description:
+        "Creates a new, empty Google Doc with the given title in the account's My Drive. " +
+        "Accepts no creation options.",
+  },
 };
+
+/**
+ * Prefix marking a document ID minted locally (by createResource) before the document exists at
+ * Google. Chosen to be visibly non-Google (real IDs are opaque base64-ish tokens) and stable: it
+ * appears in persisted resource URLs, so never change it.
+ */
+export const PROVISIONAL_DOC_ID_PREFIX = "provisional-";
+
+/** Whether a document ID is a locally-minted provisional ID rather than a Google-issued one. */
+export function isProvisionalDocId(id: string): boolean {
+  return id.startsWith(PROVISIONAL_DOC_ID_PREFIX);
+}
+
+/**
+ * The vendor half of the ResourceCreationOptions contract for a type that accepts no options:
+ * reject the whole map so a parameter the agent supplied — placement above all — is never
+ * silently dropped. The refusal quotes the type's own `creatable.description`, the surface that
+ * documents what creation does and which keys it takes.
+ */
+export function assertNoCreationOptions(
+    resource: SupportedResource, options?: ResourceCreationOptions): void {
+  let keys = Object.keys(options ?? {});
+  if (keys.length === 0) return;
+  throw new Error(
+      `Creating a ${resource.title} accepts no options, but received: ${keys.join(", ")}. ` +
+      resource.creatable?.description);
+}
 
 /** A single Google Sheet. */
 export const GOOGLE_SHEETS_RESOURCE: SupportedResource = {

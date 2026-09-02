@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, GitCache } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, ResourceCreationOptions, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, GitCache } from '@gadgets/workshop-shared/gatekeeper';
 import {
   PreviewOAuth,
   PreviewOAuthConfigurationError,
@@ -14,7 +14,7 @@ import type {
   GoogleSpreadsheetReadSession, GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange,
   SpreadsheetValueMode,
 } from "./sheets-types";
-import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
+import { docToMarkdown, emptyDocSnapshot, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
 import { DriveApi } from "./drive-api";
 import { driveObserverTracker } from "./drive-observers";
 import {
@@ -67,10 +67,13 @@ import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } f
 import {
   BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
   GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE,
-  GOOGLE_SHARED_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, RESOURCE_BY_KIND, SUPPORTED_RESOURCES,
-  grantedResourceUrlPatterns, hasDriveResourceGrant, parseResourceUrl,
+  GOOGLE_SHARED_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, PROVISIONAL_DOC_ID_PREFIX,
+  RESOURCE_BY_KIND, SUPPORTED_RESOURCES,
+  assertNoCreationOptions, grantedResourceUrlPatterns, hasDriveResourceGrant, isProvisionalDocId,
+  parseResourceUrl,
   recordedResourceUrlPatterns, type RecordedResourceGrant,
 } from "./resources";
+import { ProvisionalIds } from "@gadgets/gatekeeper-kit/simulation";
 import {
   beginStoredOAuthFlow, claimStoredOAuthFlow, mergeGrantedResources, prepareOAuthFlow,
   shouldDeleteCredentialsOnAlarm, type OAuthFlowMode,
@@ -712,6 +715,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         return {class: this.ctx.exports.GmailGatekeeperImpl({props}), resource};
       }
       case "doc": {
+        // A provisional id names a document that was never created (its creation is undecided or
+        // was rejected). Binding it would mint a gatekeeper that can never resolve.
+        if (isProvisionalDocId(target.documentId)) {
+          throw new Error(
+              "This URL is a placeholder for a Google Doc that does not exist yet, so it cannot " +
+              "be bound. Choose an existing document.");
+        }
         let props: GoogleDocGatekeeperImplProps = {userObjectId, documentId: target.documentId};
         return {class: this.ctx.exports.GoogleDocGatekeeperImpl({props}), resource};
       }
@@ -751,6 +761,47 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         return { class: this.ctx.exports.GoogleDriveGatekeeperImpl({ props }), resource };
       }
     }
+  }
+
+  async createResource(resourceUrlPattern: string,
+                       input: {title: string, options?: ResourceCreationOptions}): Promise<{
+    class: DurableObjectClass<Gatekeeper<any>>;
+    resource: SupportedResource;
+    resourceUrl: string;
+  }> {
+    if (resourceUrlPattern !== GOOGLE_DOC_RESOURCE.urlPattern) {
+      throw new Error(
+          `Google can only create resources of type "${GOOGLE_DOC_RESOURCE.title}" ` +
+          `(${GOOGLE_DOC_RESOURCE.urlPattern}).`);
+    }
+    // Before the grant round-trip: this one the agent can fix and retry within its turn, while a
+    // missing grant ends the turn on a user action.
+    assertNoCreationOptions(GOOGLE_DOC_RESOURCE, input.options);
+
+    // Creation needs the Google Doc grant (the write scope). Fail with a readable message rather
+    // than queuing a creation action that can never apply.
+    let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
+    let granted = await this.ctx.exports.UserAccount.get(id).getGrantedResourceUrlPatterns();
+    if (!granted.includes(GOOGLE_DOC_RESOURCE.urlPattern)) {
+      throw new Error(
+          "The connected Google account has not granted Google Doc access, which document " +
+          "creation requires. The user must expand the connection's access first (reconnect " +
+          "with Google Doc enabled).");
+    }
+
+    // A random UUID rather than a stored sequence: this entrypoint is stateless, and the durable
+    // provisional→real binding lives in the gatekeeper facet's own storage.
+    let documentId = `${PROVISIONAL_DOC_ID_PREFIX}${crypto.randomUUID()}`;
+    let props: GoogleDocGatekeeperImplProps = {
+      userObjectId: this.ctx.props.userObjectId,
+      documentId,
+      creation: {title: input.title},
+    };
+    return {
+      class: this.ctx.exports.GoogleDocGatekeeperImpl({props}),
+      resource: GOOGLE_DOC_RESOURCE,
+      resourceUrl: `https://docs.google.com/document/d/${documentId}/edit`,
+    };
   }
 
   async startResourceConfigurator(
@@ -1025,6 +1076,11 @@ class PendingActionStore<Action> {
   remove(id: number): void {
     this.#kv.delete(this.#actionKey(id));
   }
+
+  /** Whether `id` was issued by this store: with no record left, the action is settled. */
+  issued(id: number): boolean {
+    return id > 0 && id < (this.#kv.get<number>("pending:nextActionId") ?? 1);
+  }
 }
 
 @validateRpc()
@@ -1080,7 +1136,26 @@ type GoogleDocAppendAction = GoogleDocActionBase & {
   markdown: string;
 }
 
-type GoogleDocAction = GoogleDocReplaceAction | GoogleDocAppendAction;
+/**
+ * Creates the document itself (see GatekeeperUser.createResource). Always the first pending
+ * action, so in-order approval applies it before any queued edit.
+ */
+type GoogleDocCreateAction = GoogleDocActionBase & {
+  type: "createDocument";
+  title: string;
+}
+
+type GoogleDocAction = GoogleDocReplaceAction | GoogleDocAppendAction | GoogleDocCreateAction;
+
+/**
+ * `baseRevisionId` sentinel for actions queued before the document exists. The field is stored
+ * but never consumed by simulation or materialization, so no real revision can collide with it.
+ */
+const PROVISIONAL_REVISION = "provisional";
+/** Set once submitCreationAction has queued the creation, making retried calls no-ops. */
+const DOC_CREATION_SUBMITTED_KEY = "docCreationSubmitted";
+/** The rejection reason, once the user rejects the creation action. The binding is then dead. */
+const DOC_CREATION_REJECTED_KEY = "docCreationRejected";
 
 const DOC_WRITE_RECEIPT_KEY = "docWriteReceipt";
 const DOC_METADATA_REVISION_KEY = "docMetadataRevision";
@@ -1260,6 +1335,9 @@ function applyGoogleDocActionToMarkdown(markdown: string, action: GoogleDocActio
           markdown, action.oldMarkdown, action.newMarkdown, "replaceText");
     case "appendText":
       return appendMarkdownForSimulation(markdown, action.markdown);
+    case "createDocument":
+      // Simulation starts from the empty snapshot the creation implies; nothing to change.
+      return markdown;
     default:
       action satisfies never;
       throw new Error(`unknown action type: ${(action as any).type}`);
@@ -1334,6 +1412,11 @@ function materializeGoogleDocAction(snapshot: DocSnapshot, action: GoogleDocActi
       return markdownToDocRequests("\n" + action.markdown, insertAt);
     }
 
+    case "createDocument":
+      // Creation calls documents.create directly in #applyAction; it never becomes batchUpdate
+      // requests against an existing document.
+      throw new Error("createDocument cannot be materialized as document edits");
+
     default:
       action satisfies never;
       throw new Error(`unknown action type: ${(action as any).type}`);
@@ -1342,7 +1425,10 @@ function materializeGoogleDocAction(snapshot: DocSnapshot, action: GoogleDocActi
 
 type GoogleDocGatekeeperImplProps = {
   userObjectId: string;
+  /** Provisional (see PROVISIONAL_DOC_ID_PREFIX) when the binding was minted by createResource. */
   documentId: string;
+  /** Present only on bindings minted by createResource: what to create when the user approves. */
+  creation?: {title: string};
 }
 
 // All Google Doc edits (replaceText, appendText, ...) are grouped under a single action kind
@@ -1350,6 +1436,48 @@ const EDIT_DOCUMENT_ACTION: ActionKind = {
   tag: "editDocument",
   label: "Document edits",
 };
+
+// Creating the document is deliberately its own kind, never auto-approvable.
+const CREATE_DOCUMENT_ACTION: ActionKind = {
+  tag: "createDocument",
+  label: "Document creation",
+};
+
+/** The provisional→real documentId binding for a doc gatekeeper minted by createResource. */
+function docProvisionalIds(kv: DurableObjectStorage["kv"]): ProvisionalIds<string> {
+  return new ProvisionalIds<string>(kv, {
+    namespace: "doc:",
+    isProvisional: isProvisionalDocId,
+  });
+}
+
+/** Key prefix for the document a doc binding has disclosed data from. */
+const DOC_OBSERVATION_PREFIX = "observedDoc:";
+
+/**
+ * The observer tracker for one doc binding, seeded with the document it was minted against.
+ *
+ * The seed is what makes admission an ACL check from the first open, as a binding to an existing
+ * document warrants. It is withheld for a provisional id, whose document does not exist yet:
+ * nothing readable through the binding is provider data until the creation is applied, and the
+ * first read after that tracks the real id, forward-excluding observers admitted before it.
+ */
+function docObserverTracker(kv: DurableObjectStorage["kv"], mintedDocumentId: string)
+    : ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
+  if (!isProvisionalDocId(mintedDocumentId)) {
+    let key = `${DOC_OBSERVATION_PREFIX}${encodeURIComponent(mintedDocumentId)}`;
+    if (kv.get(key) === undefined) kv.put(key, "observed");
+  }
+  return new ObserverTracker<string, Fetcher<GoogleVerifierApi>>(kv, {
+    setPrefix: DOC_OBSERVATION_PREFIX,
+    encode: encodeURIComponent,
+    decode: decodeURIComponent,
+    hasAccess: (verifier, documentId) => verifier.hasDocAccess(documentId),
+    deniedMessage: () =>
+      "This collaborator does not have access to the bound Google Doc, so they cannot be allowed " +
+      "to observe data this workspace read from it.",
+  });
+}
 
 @validateRpc()
 export class GoogleDocGatekeeperImpl
@@ -1385,6 +1513,7 @@ export class GoogleDocGatekeeperImpl
 
   async #reconcileDocWriteReceipt(
     api: GoogleDocsApi,
+    documentId: string,
     document: GoogleDocsDocument,
   ): Promise<GoogleDocsDocument> {
     let receipt = this.#readDocWriteReceipt();
@@ -1398,9 +1527,9 @@ export class GoogleDocGatekeeperImpl
       return document;
     }
 
-    await api.deleteNamedRange(this.ctx.props.documentId, receipt.markerId);
+    await api.deleteNamedRange(documentId, receipt.markerId);
     this.#clearDocWriteReceipt(receipt.markerId);
-    return api.getDocument(this.ctx.props.documentId);
+    return api.getDocument(documentId);
   }
 
   /**
@@ -1426,11 +1555,33 @@ export class GoogleDocGatekeeperImpl
     });
   }
 
+  /** The Google-issued documentId, or undefined while a created document is still pending. */
+  #resolvedDocumentId(): string | undefined {
+    let id = docProvisionalIds(this.ctx.storage.kv).resolve(this.ctx.props.documentId);
+    return isProvisionalDocId(id) ? undefined : id;
+  }
+
   async describe(): Promise<ResourceDescription> {
+    let documentId = this.#resolvedDocumentId();
+    if (documentId === undefined) {
+      // The document exists only locally; answer from the creation parameters — describe() must
+      // not call the provider for a resource that isn't there yet.
+      let title = this.ctx.props.creation?.title ?? "Untitled document";
+      let rejected = this.ctx.storage.kv.get<string>(DOC_CREATION_REJECTED_KEY);
+      return {
+        url: `https://docs.google.com/document/d/${this.ctx.props.documentId}/edit`,
+        title,
+        snippet: rejected
+            ? `Google Doc (creation rejected): ${title}`
+            : `Google Doc (pending creation): ${title}`,
+        suggestedBindingName: "GOOGLE_DOC",
+        tsType: "GoogleDocSession",
+      };
+    }
     let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
-    let doc = await api.getDocumentMetadata(this.ctx.props.documentId);
+    let doc = await api.getDocumentMetadata(documentId);
     return {
-      url: `https://docs.google.com/document/d/${this.ctx.props.documentId}/edit`,
+      url: `https://docs.google.com/document/d/${documentId}/edit`,
       title: doc.title,
       snippet: `Google Doc: ${doc.title}`,
       suggestedBindingName: "GOOGLE_DOC",
@@ -1446,6 +1597,40 @@ export class GoogleDocGatekeeperImpl
     return [EDIT_DOCUMENT_ACTION];
   }
 
+  async submitCreationAction(approvalQueue: RpcStub<ApprovalQueue>): Promise<void> {
+    let creation = this.ctx.props.creation;
+    if (!creation) {
+      throw new Error("This Google Doc gatekeeper was not minted by createResource().");
+    }
+    if (this.ctx.storage.kv.get<boolean>(DOC_CREATION_SUBMITTED_KEY)) return;
+
+    let pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
+    let action: GoogleDocAction = {
+      type: "createDocument",
+      documentId: this.ctx.props.documentId,
+      submittedAt: Date.now(),
+      baseRevisionId: PROVISIONAL_REVISION,
+      title: creation.title,
+    };
+    let actionId = pendingActions.submit(action);
+    this.ctx.storage.kv.put(DOC_CREATION_SUBMITTED_KEY, true);
+    try {
+      await approvalQueue.submitAction(actionId, {
+        title: `Create Google Doc "${creation.title}"`,
+        description:
+            `Create a new, empty Google Doc titled "${creation.title}" in the account's ` +
+            `My Drive. Edits queued before approval apply to it afterward, in order.`,
+        implementsRevert: false,
+        actionKind: CREATE_DOCUMENT_ACTION,
+        autoApprovable: false,
+      });
+    } catch (error) {
+      pendingActions.remove(actionId);
+      this.ctx.storage.kv.delete(DOC_CREATION_SUBMITTED_KEY);
+      throw error;
+    }
+  }
+
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<GoogleDocSession> {
     let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
@@ -1456,7 +1641,8 @@ export class GoogleDocGatekeeperImpl
         approvalQueue.dup(),
         pendingActions,
         this.ctx.storage,
-        this.#simulationCache);
+        this.#simulationCache,
+        this.ctx.props.creation);
   }
 
   async applyAction(actionId: number, _cache: RpcStub<GitCache>): Promise<void> {
@@ -1472,7 +1658,16 @@ export class GoogleDocGatekeeperImpl
     let pending = pendingActions.list();
     let pendingIndex = pending.findIndex(({id}) => id === actionId);
     if (pendingIndex === -1) {
-      throw new Error(`Unknown pending Google Doc action: ${actionId}`);
+      // The overseer retries a decision whose reply was lost, by which time the record is gone.
+      // Settling again is a no-op, where throwing would strand an approval that can never be
+      // decided: the card stays pending and every queued edit behind it is blocked.
+      if (!pendingActions.issued(actionId)) {
+        throw new Error(`Unknown Google Doc action: ${actionId}`);
+      }
+      logger.warn("re-applying an already-settled Google Doc action", {
+        event: "google.doc.action.apply.settled", actionId,
+      });
+      return;
     }
     let action = pending[pendingIndex].action;
     if (action.invalidatedReason) {
@@ -1488,14 +1683,31 @@ export class GoogleDocGatekeeperImpl
         `${firstPending?.id} before edit ${actionId}.`);
     }
 
+    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+    let docIds = docProvisionalIds(this.ctx.storage.kv);
+
+    if (action.type === "createDocument") {
+      // A crash between documents.create and bind() can leak one duplicate doc at Google —
+      // documents.create has no idempotency key; accepted for now.
+      let created = await api.createDocument(action.title);
+      docIds.bind(action.documentId, created.documentId);
+      pendingActions.remove(actionId);
+      this.#simulationCache.current = undefined;
+      // Simulated content moves from the synthetic empty base to the real (still empty) document.
+      await this.ctx.storage.delete(DOC_SNAPSHOT_KEY);
+      return;
+    }
+
+    // Queued edits recorded the provisional id when they predate the creation; the in-order rule
+    // means the creation has been applied by now, so this resolves (or throws a clear message).
+    let documentId = docIds.requireResolved(action.documentId);
     if (!action.writeId) {
       action.writeId = crypto.randomUUID();
       pendingActions.put(actionId, action);
     }
     let writeMarkerName = googleDocWriteMarkerName(action.writeId);
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
-    let doc = await api.getDocument(action.documentId);
-    doc = await this.#reconcileDocWriteReceipt(api, doc);
+    let doc = await api.getDocument(documentId);
+    doc = await this.#reconcileDocWriteReceipt(api, documentId, doc);
     let snapshot = googleDocSnapshot(doc);
     let markerIds = googleDocNamedRangeIds(doc, writeMarkerName);
     if (markerIds.length > 1) {
@@ -1522,7 +1734,7 @@ export class GoogleDocGatekeeperImpl
         return;
       }
       if (requests.length > 0) {
-        let result = await api.batchUpdate(action.documentId, requests, snapshot.revisionId, {
+        let result = await api.batchUpdate(documentId, requests, snapshot.revisionId, {
           name: writeMarkerName,
           rangeStart: snapshot.bodyEndIndex - 1,
         });
@@ -1535,7 +1747,7 @@ export class GoogleDocGatekeeperImpl
     if (writeMarkerId) {
       this.#handoffDocWriteReceipt(actionId, writeMarkerId, pendingActions);
       try {
-        await api.deleteNamedRange(action.documentId, writeMarkerId);
+        await api.deleteNamedRange(documentId, writeMarkerId);
         this.#clearDocWriteReceipt(writeMarkerId);
       } catch (error) {
         logger.warn("failed to clean up Google Doc write marker", {
@@ -1550,7 +1762,7 @@ export class GoogleDocGatekeeperImpl
     try {
       let refreshedSnapshot = snapshot;
       if (writeMarkerId) {
-        refreshedSnapshot = googleDocSnapshot(await api.getDocument(action.documentId));
+        refreshedSnapshot = googleDocSnapshot(await api.getDocument(documentId));
       }
       await this.ctx.storage.put(DOC_SNAPSHOT_KEY, refreshedSnapshot);
       invalidateUnreplayableGoogleDocActions(
@@ -1571,14 +1783,37 @@ export class GoogleDocGatekeeperImpl
     let pending = pendingActions.list();
     let index = pending.findIndex(({id}) => id === actionId);
     if (index === -1) {
-      throw new Error(`Unknown pending Google Doc action: ${actionId}`);
+      // Already settled by a decision whose reply was lost; see #applyAction.
+      if (!pendingActions.issued(actionId)) {
+        throw new Error(`Unknown Google Doc action: ${actionId}`);
+      }
+      logger.warn("re-rejecting an already-settled Google Doc action", {
+        event: "google.doc.action.reject.settled", actionId,
+      });
+      return;
     }
 
-    let wasActive = !pending[index].action.invalidatedReason;
+    let rejected = pending[index].action;
+    let wasActive = !rejected.invalidatedReason;
 
     pendingActions.remove(actionId);
     this.#simulationCache.current = undefined;
     await this.ctx.storage.delete(DOC_SNAPSHOT_KEY);
+
+    if (rejected.type === "createDocument" && wasActive) {
+      // Rejecting the creation kills the binding: nothing the queued edits target will ever
+      // exist. Invalidate them all (the user still sees and clears their cards) and mark the
+      // binding dead so session methods explain instead of simulating against nothing.
+      this.ctx.storage.kv.put(
+          DOC_CREATION_REJECTED_KEY, "The user rejected creating this Google Doc.");
+      for (let other of pending) {
+        if (other.id !== actionId) {
+          invalidateGoogleDocAction(
+              pendingActions, other,
+              "The document creation was rejected, so this edit can never be applied.");
+        }
+      }
+    }
 
     if (wasActive && index < pending.length - 1) {
       return {restart: true};
@@ -1591,22 +1826,25 @@ export class GoogleDocGatekeeperImpl
   }
 
   /**
-   * Observer tracking — strategy B (ACL check, single unit). The binding is one document, so we just
-   * confirm the observer can open it with their own token (hasDocAccess, via the Drive/Docs ACL).
-   * The document is the atomic unit (everything read through this binding is that one doc), so no
-   * observers are tracked and removeObserver is a no-op. The overseer re-runs addObserver on every
-   * open, catching loss of access promptly.
+   * Observer tracking — strategy C over a single unit, the document itself.
+   *
+   * A binding minted against an existing document can always reach it, so the set is seeded and
+   * admission is the ACL check (hasDocAccess, via the Drive/Docs ACL) from the first open. A
+   * created document has no ACL to consult until it exists, so nothing is seeded and observers
+   * join unchecked; the first read of the real document then tracks it and forward-excludes
+   * whoever cannot reach it, which is what the unchecked admission owes.
    */
-  async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
-    let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
-    if (!(await verifier.hasDocAccess(this.ctx.props.documentId))) {
-      throw new Error(
-        "This collaborator does not have access to the bound Google Doc, so they cannot be allowed " +
-        "to observe data this workspace read from it.");
-    }
+  get #observers(): ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
+    return docObserverTracker(this.ctx.storage.kv, this.ctx.props.documentId);
   }
 
-  async removeObserver(_id: string): Promise<void> {}
+  async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    await this.#observers.addObserver(id, user as unknown as Fetcher<GoogleVerifierApi>);
+  }
+
+  async removeObserver(id: string): Promise<void> {
+    this.#observers.removeObserver(id);
+  }
 }
 
 @validateRpc()
@@ -1617,6 +1855,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   #pendingActions: PendingActionStore<GoogleDocAction>;
   #storage: DurableObjectStorage;
   #simulationCache: GoogleDocSimulationCacheHolder;
+  #creation?: {title: string};
 
   constructor(
     docsApi: GoogleDocsApi,
@@ -1625,6 +1864,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     pendingActions: PendingActionStore<GoogleDocAction>,
     storage: DurableObjectStorage,
     simulationCache: GoogleDocSimulationCacheHolder,
+    creation?: {title: string},
   ) {
     super();
     this.#docsApi = docsApi;
@@ -1633,9 +1873,38 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     this.#pendingActions = pendingActions;
     this.#storage = storage;
     this.#simulationCache = simulationCache;
+    this.#creation = creation;
+  }
+
+  /**
+   * The Google-issued documentId to use against the API, or undefined while a created document is
+   * still pending. Resolved per call, not at construction: the creation can be approved while
+   * this session is live.
+   */
+  #apiDocumentId(): string | undefined {
+    let id = docProvisionalIds(this.#storage.kv).resolve(this.#documentId);
+    return isProvisionalDocId(id) ? undefined : id;
+  }
+
+  /** Throws the dead-binding explanation once the user has rejected creating this document. */
+  #checkCreationRejected(): void {
+    let reason = this.#storage.kv.get<string>(DOC_CREATION_REJECTED_KEY);
+    if (reason) {
+      throw new Error(
+          `${reason} This binding will never work — ask the user how to proceed (they can ` +
+          `remove the connection, or you can create a new document).`);
+    }
   }
 
   async #getSnapshot(forceRefresh?: boolean): Promise<DocSnapshot> {
+    let documentId = this.#apiDocumentId();
+    if (documentId === undefined) {
+      // The document exists only locally. Simulate over an empty base; never stored under
+      // DOC_SNAPSHOT_KEY so a real fetch replaces it naturally once the creation is applied.
+      return emptyDocSnapshot(
+          this.#creation?.title ?? "Untitled document", PROVISIONAL_REVISION);
+    }
+
     if (!forceRefresh) {
       let cached = await this.#storage.get<DocSnapshot>(DOC_SNAPSHOT_KEY);
       if (cached) {
@@ -1644,7 +1913,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
           return cached;
         }
         // TTL expired — check if document has changed.
-        let currentRevisionId = await this.#docsApi.getRevisionId(this.#documentId);
+        let currentRevisionId = await this.#docsApi.getRevisionId(documentId);
         if (currentRevisionId === cached.revisionId) {
           cached.fetchedAt = Date.now();
           await this.#storage.put(DOC_SNAPSHOT_KEY, cached);
@@ -1654,7 +1923,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     }
 
     // Fetch full document and build snapshot.
-    let doc = await this.#docsApi.getDocument(this.#documentId);
+    let doc = await this.#docsApi.getDocument(documentId);
     let snapshot = googleDocSnapshot(doc);
     await this.#storage.put(DOC_SNAPSHOT_KEY, snapshot);
     return snapshot;
@@ -1665,6 +1934,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     markdown: string,
     pendingActions: GoogleDocAction[],
   }> {
+    this.#checkCreationRejected();
     let snapshot = await this.#getSnapshot();
     let pending = this.#pendingActions.list();
     let pendingFingerprint = googleDocPendingFingerprint(pending);
@@ -1701,6 +1971,26 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   /**
+   * Authorize a read, recording the real document as data this binding has disclosed.
+   *
+   * A read of the uncreated document discloses only workspace-authored simulation, so it excludes
+   * nobody — and must not, since the overseer refuses an exclusion it cannot honour, which would
+   * block the read outright.
+   */
+  async #authorizeRead(description: ObservationDescription): Promise<void> {
+    let documentId = this.#apiDocumentId();
+    if (documentId === undefined) {
+      await this.#approvalQueue.authorizeObservation(description);
+      return;
+    }
+    let check = await docObserverTracker(this.#storage.kv, this.#documentId)
+        .prepareObservation([documentId]);
+    await this.#approvalQueue.authorizeObservation(
+        {...description, excludeObservers: check.excludeObservers});
+    check.commit();
+  }
+
+  /**
    * Current title, and a modification time that only advances when something changed.
    *
    * Google Docs exposes no modification time, so the moment this binding first saw the current
@@ -1709,23 +1999,30 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
    * `getContent()` already shows them.
    */
   async getMetadata(): Promise<DocMetadata> {
-    let metadata = await this.#docsApi.getDocumentMetadata(this.#documentId);
-    let revisedAt = this.#observeDocRevision(metadata.revisionId);
+    this.#checkCreationRejected();
+    let documentId = this.#apiDocumentId();
     let pendingActions = this.#pendingActions.list()
         .map(({action}) => action)
         .filter(action => !action.invalidatedReason);
 
-    await this.#approvalQueue.authorizeObservation({
+    // While the document exists only locally its metadata is the creation parameters, dated by
+    // the pending actions (the creation itself is among them, so the reduce never yields 0).
+    let title = this.#creation?.title ?? "Untitled document";
+    let revisedAt = 0;
+    if (documentId !== undefined) {
+      let metadata = await this.#docsApi.getDocumentMetadata(documentId);
+      title = metadata.title;
+      revisedAt = this.#observeDocRevision(metadata.revisionId);
+    }
+
+    await this.#authorizeRead({
       title: "Read Google Doc metadata",
       description: "Read the title and modification time of the document.",
     });
 
     let lastModified = pendingActions.reduce(
         (latest, action) => Math.max(latest, action.submittedAt), revisedAt);
-    return {
-      title: metadata.title,
-      lastModified: new Date(lastModified),
-    };
+    return {title, lastModified: new Date(lastModified)};
   }
 
   /**
@@ -1751,7 +2048,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   async getContent(): Promise<string> {
     let {markdown} = await this.#getSimulatedContent();
 
-    await this.#approvalQueue.authorizeObservation({
+    await this.#authorizeRead({
       title: "Read Google Doc content",
       description: "Read the full simulated content of the document as Markdown.",
     });

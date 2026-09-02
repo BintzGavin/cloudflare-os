@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE, GOOGLE_DOC_RESOURCE,
   GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_RESOURCE, GOOGLE_SHARED_DRIVE_RESOURCE,
-  GOOGLE_SHEETS_RESOURCE, IDENTITY_SCOPES, LEGACY_GRANTED_RESOURCE_URL_PATTERNS, RESOURCE_BY_KIND,
-  RESOURCE_SCOPES, SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
-  grantedResourceUrlPatterns, hasDriveResourceGrant, parseResourceUrl,
+  GOOGLE_SHEETS_RESOURCE, IDENTITY_SCOPES, LEGACY_GRANTED_RESOURCE_URL_PATTERNS,
+  PROVISIONAL_DOC_ID_PREFIX, RESOURCE_BY_KIND, RESOURCE_SCOPES,
+  SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES,
+  assertNoCreationOptions, grantedResourceUrlPatterns, hasDriveResourceGrant, isProvisionalDocId,
+  parseResourceUrl,
   recordedResourceUrlPatterns, resourceUrlPatternsToOAuthScopes, resourcesCoveredByScopes,
   validateResourceUrlPatterns,
 } from "../src/resources";
@@ -55,6 +57,27 @@ describe("resource declarations", () => {
   it("has a distinct pattern per resource", () => {
     let patterns = SUPPORTED_RESOURCES.map(r => r.urlPattern);
     expect(new Set(patterns).size).toBe(patterns.length);
+  });
+
+  // The vendor half of the ResourceCreationOptions contract. A dropped option is a placement the
+  // user asked for and silently did not get, so every key is refused while none is accepted.
+  describe("creation options", () => {
+    it("accepts an absent or empty map", () => {
+      expect(() => assertNoCreationOptions(GOOGLE_DOC_RESOURCE)).not.toThrow();
+      expect(() => assertNoCreationOptions(GOOGLE_DOC_RESOURCE, {})).not.toThrow();
+    });
+
+    it("refuses every key, naming them and what creation does instead", () => {
+      expect(() => assertNoCreationOptions(GOOGLE_DOC_RESOURCE, {parentId: "abc", pinned: true}))
+        .toThrow(/accepts no options, but received: parentId, pinned\./);
+      expect(() => assertNoCreationOptions(GOOGLE_DOC_RESOURCE, {parentId: "abc"}))
+        .toThrow(/in the account's My Drive/);
+    });
+
+    it("refuses a key that would otherwise reach vendor code as a prototype write", () => {
+      expect(() => assertNoCreationOptions(GOOGLE_DOC_RESOURCE, JSON.parse('{"__proto__": "x"}')))
+        .toThrow(/accepts no options/);
+    });
   });
 
   // Adding an entry short-circuits ensureResources, so a legacy account would be treated as
@@ -377,6 +400,15 @@ describe("parseResourceUrl", () => {
     it("extracts a document ID, ignoring trailing path", () => {
       expect(parseResourceUrl("https://docs.google.com/document/d/DOC123/edit?usp=sharing"))
         .toEqual({ kind: "doc", documentId: "DOC123" });
+    });
+
+    // getGatekeeperClassFor refuses to bind such a URL: the document was never created. The
+    // placeholder must stay recognisable through the URL grammar for that guard to fire.
+    it("keeps a provisional document ID recognisable", () => {
+      let documentId = `${PROVISIONAL_DOC_ID_PREFIX}abc`;
+      let target = parseResourceUrl(`https://docs.google.com/document/d/${documentId}/edit`);
+      expect(target).toEqual({ kind: "doc", documentId });
+      expect(target.kind === "doc" && isProvisionalDocId(target.documentId)).toBe(true);
     });
 
     it("extracts a spreadsheet ID", () => {
