@@ -1437,7 +1437,8 @@ const EDIT_DOCUMENT_ACTION: ActionKind = {
   label: "Document edits",
 };
 
-// Creating the document is deliberately its own kind, never auto-approvable.
+// Creating the document is deliberately its own kind, so hands-free creation (e.g. a scheduled
+// task minting a new doc each day) is a separate opt-in rule from the far more common edits one.
 const CREATE_DOCUMENT_ACTION: ActionKind = {
   tag: "createDocument",
   label: "Document creation",
@@ -1594,7 +1595,7 @@ export class GoogleDocGatekeeperImpl
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [EDIT_DOCUMENT_ACTION];
+    return [EDIT_DOCUMENT_ACTION, CREATE_DOCUMENT_ACTION];
   }
 
   async submitCreationAction(approvalQueue: RpcStub<ApprovalQueue>): Promise<void> {
@@ -1622,7 +1623,7 @@ export class GoogleDocGatekeeperImpl
             `My Drive. Edits queued before approval apply to it afterward, in order.`,
         implementsRevert: false,
         actionKind: CREATE_DOCUMENT_ACTION,
-        autoApprovable: false,
+        autoApprovable: true,
       });
     } catch (error) {
       pendingActions.remove(actionId);
