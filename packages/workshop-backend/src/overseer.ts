@@ -925,7 +925,15 @@ type ChatModelDataRecord = {
 // Overseer.proposedChangeWorkpieceIds) carried a cached `hasProposedChanges` flag; nothing
 // writes or reads it anymore, but old rows still hold stale values, so the stored shape admits
 // it and chatMetaForClient strips it from deliveries.
-type StoredChatMetadata = AiChatMetadata & {hasProposedChanges?: boolean};
+//
+// `measuredSystemPromptChars` is the length of the system prompt sent with the step that
+// `totalTokens` measured, written and cleared with it (see addChatMessages and the
+// `delete meta.totalTokens` sites). Compaction sizing charges the next turn for how much the
+// system prompt has changed since (see estimateContextTokens). Server-only, like the flag.
+type StoredChatMetadata = AiChatMetadata & {
+  hasProposedChanges?: boolean;
+  measuredSystemPromptChars?: number;
+};
 
 // If live change rows exist whose newest author differs from a new submission's author and the
 // stream has been idle this long, the older author's rows are materialized into their own
@@ -3235,6 +3243,7 @@ class OverseerImpl implements AgentHooks {
   chatMetaForClient(stored: StoredChatMetadata): AiChatMetadata {
     let meta: StoredChatMetadata = {...stored};
     delete meta.hasProposedChanges;
+    delete meta.measuredSystemPromptChars;
     let proposed = this.proposedChangeWorkpieceIds(stored.id, stored);
     if (proposed.length > 0) {
       meta.proposedChangeWorkpieces = proposed;
@@ -3627,7 +3636,8 @@ class OverseerImpl implements AgentHooks {
         addedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
         worktreeCommits: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
       },
-      totalTokens?: number, aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
+      measured?: {totalTokens: number, systemPromptChars: number},
+      aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
       estimatedCost?: number): Promise<boolean> {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) return false;  // chat deleted mid-turn
@@ -3744,7 +3754,7 @@ class OverseerImpl implements AgentHooks {
           }
         }
 
-        this.addChatMessages(chatId, author, msgs, totalTokens, aiGatewayLogId,
+        this.addChatMessages(chatId, author, msgs, measured, aiGatewayLogId,
                              aiGatewayLogRoute, estimatedCost);
         return this.materializeChatChanges(chatId, undefined, {
           author,
@@ -6319,7 +6329,7 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  getChatMetaOrThrow(chatId: number): AiChatMetadata {
+  getChatMetaOrThrow(chatId: number): StoredChatMetadata {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) {
       throw new Error("No such chatId: " + chatId);
@@ -6327,7 +6337,7 @@ class OverseerImpl implements AgentHooks {
     return meta;
   }
 
-  assertChatNotActive(chatId: number, allowMessagePreparation = false): AiChatMetadata {
+  assertChatNotActive(chatId: number, allowMessagePreparation = false): StoredChatMetadata {
     let meta = this.getChatMetaOrThrow(chatId);
     if (meta.activeAgent || !allowMessagePreparation && this.isPreparingChatMessage(chatId)) {
       throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
@@ -6896,6 +6906,7 @@ class OverseerImpl implements AgentHooks {
       // The prompt is about to shrink, so the recorded total no longer describes it. Without this
       // the next turn would weigh a short prompt's usage against a long one and never re-trigger.
       delete meta.totalTokens;
+      delete meta.measuredSystemPromptChars;
       this.storage.chatMeta.put(meta);
     });
   }
@@ -6903,7 +6914,7 @@ class OverseerImpl implements AgentHooks {
   // Points the chat at the newest checkpoint a revert leaves intact. A revert erases Yjs history from
   // `revertFrom` onward, so any checkpoint that folded in those changes can never be replayed again
   // and is deleted; earlier ones stay, which is what lets a revert cross a boundary at all.
-  rollbackChatCompaction(meta: AiChatMetadata, revertFrom: number): void {
+  rollbackChatCompaction(meta: StoredChatMetadata, revertFrom: number): void {
     // Buffer the keys first: deleting invalidates the list cursor.
     let stale = Array.from(
         this.storage.chatCompactions.list({
@@ -6923,6 +6934,7 @@ class OverseerImpl implements AgentHooks {
     if (meta.compactedTo !== previousBoundary) {
       // Replay now starts further back, so the prompt is longer than the recorded total describes.
       delete meta.totalTokens;
+      delete meta.measuredSystemPromptChars;
     }
   }
 
@@ -7041,12 +7053,14 @@ class OverseerImpl implements AgentHooks {
         let callbackCountBefore = liveChat.activeAgentCallbacks.size;
 
         let compactionTurn = isCompactionTurn(chatMessages);
+        let {totalTokens, measuredSystemPromptChars} = this.getChatMetaOrThrow(chatId);
         let newCheckpoint = await runAgent(
             this, chosenModel, chatId, aiModel.profile, chatMessages, controller.signal,
             initiator, callbackInitiated, {
               checkpoint,
               modelConfig: aiModel.config,
-              measuredTokens: this.getChatMetaOrThrow(chatId).totalTokens ?? 0,
+              measured: totalTokens
+                  ? {totalTokens, systemPromptChars: measuredSystemPromptChars} : undefined,
             });
         if (newCheckpoint) this.#commitChatCompaction(chatId, newCheckpoint);
         // `/compact` is done once it has compacted. An automatic compaction returned before
@@ -8381,7 +8395,7 @@ class OverseerImpl implements AgentHooks {
 
   addChatMessages(chatId: number, author: AiChatAuthorInfo,
         msgs: AiChatMessageBodyWithModelData[],
-        totalTokens?: number, aiGatewayLogId?: string,
+        measured?: {totalTokens: number, systemPromptChars: number}, aiGatewayLogId?: string,
         aiGatewayLogRoute?: AiGatewayLogRoute, estimatedCost?: number): void {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) {
@@ -8467,8 +8481,9 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    if (totalTokens !== undefined) {
-      meta.totalTokens = totalTokens;
+    if (measured !== undefined) {
+      meta.totalTokens = measured.totalTokens;
+      meta.measuredSystemPromptChars = measured.systemPromptChars;
     }
 
     meta.lastActive = this.getChatTimestamp();

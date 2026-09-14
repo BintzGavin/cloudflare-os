@@ -248,6 +248,32 @@ export function estimateProjectionTokens(projection: CompactionProjectionMessage
     total + projectionMessageWeight(message), 0) / 4);
 }
 
+/**
+ * The prompt size the compaction decision weighs against the input budget. Provider usage from the
+ * last measured step (`measured`) covers that step's prompt and response, so only the messages
+ * added since are estimated: those after `measured.sequence`, plus that record's own tool results,
+ * which were produced after the request it measured. The system prompt sits outside the
+ * projection and can change between turns (its catalogs are reloaded each turn), so its growth
+ * since the measured length is added as well. A shrink is not credited: the usage is exact and the
+ * ratio a heuristic, so subtracting could under-count and skip a compaction the provider then
+ * refuses, with no successful step left to correct the baseline; over-counting only compacts
+ * earlier, and the next measured step re-baselines. A measurement taken before the length was
+ * recorded prices the prompt as unchanged. With no measurement everything is estimated.
+ */
+export function estimateContextTokens(
+    projection: CompactionProjectionMessage[], systemPromptChars: number,
+    measured?: {totalTokens: number, systemPromptChars?: number, sequence: number}): number {
+  if (measured === undefined) {
+    return estimateProjectionTokens(projection) + Math.ceil(systemPromptChars / 4);
+  }
+  let unmeasured = projection.filter(({message, sequence}) => sequence !== undefined &&
+    (sequence > measured.sequence ||
+     (sequence === measured.sequence && message.role === "toolResult")));
+  let promptGrowth = measured.systemPromptChars === undefined
+      ? 0 : Math.max(0, Math.ceil((systemPromptChars - measured.systemPromptChars) / 4));
+  return measured.totalTokens + estimateProjectionTokens(unmeasured) + promptGrowth;
+}
+
 function flattenModelMessage(message: Message): string {
   if (message.role === "toolResult") {
     let text = message.content.map(part =>

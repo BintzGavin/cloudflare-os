@@ -2,9 +2,9 @@ import {describe, expect, it} from "vitest";
 import {type AiChatAuthorInfo, type AiChatMessage, type AiChatMessageBody}
   from "@gadgets/workshop-shared/api";
 import {
-  buildCompactionState, buildSummaryPrompt, findCompactionBoundary, findProtectedFromSequence,
-  foldProposedChanges, getModelTokenLimits, isCompactionTurn, protectRetainedReverts,
-  shouldCompactChat, startsAgentTurn,
+  buildCompactionState, buildSummaryPrompt, estimateContextTokens, estimateProjectionTokens,
+  findCompactionBoundary, findProtectedFromSequence, foldProposedChanges, getModelTokenLimits,
+  isCompactionTurn, protectRetainedReverts, shouldCompactChat, startsAgentTurn,
 } from "../src/agent-compaction";
 import {applyCodeChange, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import type {Api, AssistantMessage, Message, Model} from "@earendil-works/pi-ai";
@@ -140,6 +140,39 @@ describe("compaction trigger", () => {
       type: "connectionRequest", requestId: "1:1", vendorId: "v", vendorName: "V",
       reason: "Needed", state: "pending",
     }))).toBe(false);
+  });
+});
+
+describe("context estimate", () => {
+  let messages = [
+    message(0, user, "first request"),
+    message(1, agent, "first response"),
+    message(2, user, "follow-up"),
+  ];
+  let toolResult: Message = {
+    role: "toolResult", toolCallId: "call", toolName: "readFile",
+    content: [{type: "text", text: "file contents"}], isError: false, timestamp: 0,
+  };
+  // The tool result belongs to the measured record but was produced after the request it measured.
+  let full = [...projection(messages.slice(0, 2)), {message: toolResult, sequence: 1},
+              ...projection(messages.slice(2))];
+  let unmeasured = estimateProjectionTokens(full.slice(2));
+
+  it("estimates everything when no step has been measured", () => {
+    expect(estimateContextTokens(full, 4000))
+        .toBe(estimateProjectionTokens(full) + 1000);
+  });
+
+  it("charges only what the measured step did not cover, plus system prompt growth", () => {
+    let measured = {totalTokens: 10_000, systemPromptChars: 4000, sequence: 1};
+    expect(estimateContextTokens(full, 4000, measured)).toBe(10_000 + unmeasured);
+    // Catalogs reloaded into the system prompt can grow between turns; a shrink is not credited
+    // against the exact usage, since the next measured step re-baselines anyway.
+    expect(estimateContextTokens(full, 8000, measured)).toBe(10_000 + unmeasured + 1000);
+    expect(estimateContextTokens(full, 2000, measured)).toBe(10_000 + unmeasured);
+    // A step measured before the prompt length was recorded prices the prompt as unchanged.
+    expect(estimateContextTokens(full, 8000, {totalTokens: 10_000, sequence: 1}))
+        .toBe(10_000 + unmeasured);
   });
 });
 

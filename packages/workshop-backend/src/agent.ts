@@ -21,7 +21,7 @@ import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./
 import type { ModelHandle } from "./ai-models";
 import {
   buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
-  estimateProjectionTokens, findCompactionBoundary, findProtectedFromSequence,
+  estimateContextTokens, findCompactionBoundary, findProtectedFromSequence,
   getModelTokenLimits, isCompactionTurn, protectRetainedReverts, shouldCompactChat,
   type CompactionProjectionMessage,
 } from "./agent-compaction";
@@ -292,8 +292,11 @@ export type CompactionContext = {
   /** The chosen model, whose window and reserved response capacity size the prompt budget. */
   modelConfig: AiModelConfig;
 
-  /** The total tokens reported for the last measured model step, or zero if none are available. */
-  measuredTokens: number;
+  /**
+   * The last measured model step, if any: the tokens the provider reported for it and the length
+   * of the system prompt it was sent with (absent for steps measured before that was recorded).
+   */
+  measured?: {totalTokens: number, systemPromptChars?: number};
 };
 
 /**
@@ -421,6 +424,8 @@ export interface AgentHooks {
    * caller in overseer.ts). The rows' `changeApplied` broadcasts supersede the tool calls'
    * streamed edit previews.
    *
+   * `measured` is the step's provider-reported token total and the length of the system prompt it
+   * was sent with, which the next turn's compaction sizing starts from (see estimateContextTokens).
    * The accounting parameters match the overseer's addChatMessages: when both `aiGatewayLogId`
    * and `aiGatewayLogRoute` are present, the authoritative cost is fetched asynchronously from
    * the AI Gateway log, with `estimatedCost` (pi's catalog-priced estimate from the turn's
@@ -435,7 +440,8 @@ export interface AgentHooks {
         addedBindings: {gadgetId: WorkpieceId, name: string, target: WorkpieceId}[],
         worktreeCommits: {worktreeId: WorkpieceId, commit: string, previousHead: string}[],
       },
-      totalTokens?: number, aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
+      measured?: {totalTokens: number, systemPromptChars: number},
+      aiGatewayLogId?: string, aiGatewayLogRoute?: AiGatewayLogRoute,
       estimatedCost?: number): Promise<boolean>;
 
   /**
@@ -2502,15 +2508,9 @@ export async function runAgent(
   }));
   let lastMeasuredSequence = chatMessages.findLast(message =>
     message.type === "message" && message.author.type === "agent")?.sequence;
-  // `measuredTokens` covers the prompt and response of the last model step, so estimate only what
-  // was added after it. A tool result carries the call's sequence but wasn't in that usage.
-  // (The system prompt is not part of the projection, so the pure estimate adds it separately.)
-  let contextTokens = compaction.measuredTokens > 0 && lastMeasuredSequence !== undefined
-    ? compaction.measuredTokens + estimateProjectionTokens(
-        projection.filter(({message, sequence}) => sequence !== undefined &&
-          (sequence > lastMeasuredSequence ||
-           (sequence === lastMeasuredSequence && message.role === "toolResult"))))
-    : estimateProjectionTokens(projection) + Math.ceil(systemPrompt.length / 4);
+  let contextTokens = estimateContextTokens(projection, systemPrompt.length,
+      compaction.measured && lastMeasuredSequence !== undefined
+          ? {...compaction.measured, sequence: lastMeasuredSequence} : undefined);
 
   let compactionTurn = isCompactionTurn(chatMessages);
   if (compactionTurn || shouldCompactChat(contextTokens, inputBudget)) {
@@ -3442,7 +3442,8 @@ export async function runAgent(
         if (await hooks.commitAgentStep(chatId, author, msgs,
             {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
              worktreeCommits},
-            message.usage.totalTokens, handle.lastResponse?.aiGatewayLogId,
+            {totalTokens: message.usage.totalTokens, systemPromptChars: systemPrompt.length},
+            handle.lastResponse?.aiGatewayLogId,
             handle.aiGatewayLogRoute, message.usage.cost.total)) {
           ++nextChangeId;
         }
