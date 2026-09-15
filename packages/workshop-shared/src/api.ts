@@ -1850,7 +1850,10 @@ export interface Overseer extends RpcTarget {
    * change. A declaration identical to the existing pin is accepted idempotently; one naming a
    * different `baseCommit` (a race between two first editors) throws. Exception: a gadget still
    * pending in this chat has no head commit to pin (see WorkpieceSummary.commitId), so its changes
-   * carry no declaration and build its content up from nothing (see ChatCodeBase).
+   * carry no declaration and build its content up from nothing (see ChatCodeBase). A worktree
+   * declaration is accepted iff its `baseCommit` is the worktree's accepted commit -- the
+   * content as of the chat's last accept, the analog of a gadget's head -- exactly, with no
+   * parent tolerance (only this chat's accept moves it, and that closes the generation).
    *
    * Retries: `submission.clientId` names the client's editing session and `submission.seq`
    * numbers its submissions from 1. The server remembers each session's last accepted seq and
@@ -2436,7 +2439,9 @@ export type AiChatMetadata = {
  * created within this chat and still pending has no head commit to pin, so it stays unpinned
  * while its changes build its content up from nothing (every file starts with a `set`); the merge
  * that makes it permanent ends the epoch anyway, and in later epochs it pins like any other
- * gadget.
+ * gadget. A worktree (see createdWorktrees) follows the same rule with its accepted commit in
+ * the role of the head: unpinned it reads as that commit's tree, its first modification pins it
+ * there, and an accept advances the accepted commit rather than creating a mainline commit.
  *
  * Clients derive the chat's content themselves: for each pin, fetch the base tree
  * (Overseer.getCodeAtCommit(baseCommit)); apply the current epoch's non-reverted `changes`
@@ -2504,11 +2509,12 @@ export type ChatCodeBase = {
 };
 
 /**
- * One gadget's pin within a chat (see ChatCodeBase): the record that the gadget's code was
- * modified for the first time in the chat's current epoch, fixing the commit its uncommitted
- * changes apply on top of. A pin is established by that first modification -- a
- * submitCodeChange() pin declaration, or the agent's first write, which pins at the then-current
- * head -- and lasts until the epoch ends or the declaring message is reverted.
+ * One workpiece's pin within a chat (see ChatCodeBase): the record that the gadget's (or
+ * worktree's) code was modified for the first time in the chat's current epoch, fixing the
+ * commit its uncommitted changes apply on top of. A pin is established by that first
+ * modification -- a submitCodeChange() pin declaration, or the agent's first write (for a
+ * worktree, also its first commit()), which pins at the then-current head (a worktree's
+ * accepted commit) -- and lasts until the epoch ends or the declaring message is reverted.
  *
  * This same shape is both the declaration a client submits with a first modification
  * (CodeChangeSubmission.pins) and the permanent record of it in the chat log (the `pins` field of
@@ -2587,9 +2593,10 @@ export type CodeChangeSubmission = {
 
   /**
    * Pin declarations, one per permanent gadget this change touches that is not yet pinned in the
-   * chat (a gadget still pending in the chat is never pinned or declared). The same shape is
-   * what the chat log keeps permanently; see Overseer.submitCodeChange() for the validation
-   * rules.
+   * chat (a gadget still pending in the chat is never pinned or declared), and one per worktree
+   * it touches that is not yet pinned -- pending or not, since a worktree's content is its
+   * accepted commit's tree, never built up from nothing. The same shape is what the chat log
+   * keeps permanently; see Overseer.submitCodeChange() for the validation rules.
    */
   pins?: ChatGadgetPin[];
 
@@ -2847,9 +2854,11 @@ export type AiChatMessageBody = {
    * Deliberately separate from `createdGadgets` so a client can never mistake a worktree for a
    * gadget creation. Like gadget creations, they are provisional -- a merge through this message
    * makes the record permanent (it stays private to this chat), and a revert covering it deletes
-   * it. The batch's `pins` include the worktree's birth pin `{gadgetId: worktreeId, baseCommit}`,
-   * which is what content reconstruction roots the worktree's changes at. `bindingName` is the
-   * name in the creating chat's env, recorded so replay can pick it back up.
+   * it. A creation pins nothing: like a gadget, a worktree joins `pins` when it is first
+   * modified (see ChatGadgetPin). Batches written before that was so carry the worktree's
+   * birth pin `{gadgetId: worktreeId, baseCommit}` alongside the creation, which readers honor
+   * as an ordinary pin. `bindingName` is the name in the creating chat's env, recorded so replay
+   * can pick it back up.
    *
    * Worktree *content* is stripped from every client delivery: clients receive `change` payloads
    * without worktree entries and `pins` without worktree pins (revision numbering preserved), so
@@ -2915,17 +2924,18 @@ export type AiChatMessageBody = {
   epochBoundary?: true;
 
   /**
-   * The chat's worktree re-pins across this merge's epoch reset, present when the chat had live
-   * worktrees. The reset evaporates every pin, but a worktree's uncommitted content must survive
-   * an accept, so the merge re-pins each worktree in the new generation at `baseCommit`: a fresh
-   * local auto-commit capturing its uncommitted overlay when the closed epoch left it dirty,
-   * else its unchanged base. Auto-commits are internal bookkeeping, squashed out of explicit
-   * history -- the worktree's reported head is untouched, and a later explicit commit parents on
-   * that head, never on an auto-commit. This field is the durable record the re-pins are
-   * reconstructed from: content reconstruction and compaction checkpoints re-root worktree
-   * content here, since `pins` on "changes" messages only cover in-epoch establishment. Worktree
-   * *content* is stripped from client deliveries, but this field is not a content-fetch trigger
-   * (unlike a `pins` entry) and rides along untouched.
+   * No longer written; honored when read. Merges from when worktrees were pinned from birth
+   * recorded here the re-pin of each live worktree in the new generation, at `baseCommit`: a
+   * fresh local auto-commit capturing its uncommitted overlay when the closed epoch left it
+   * dirty, else its unchanged base. Content reconstruction and compaction checkpoints still
+   * re-root worktree content at these pins so the epochs they open fold as they were written.
+   * Today a worktree pins on first modification like a gadget, and an accept merely advances
+   * the worktree's accepted commit (to the same auto-commit) with no pin in the new generation,
+   * so a merge written now carries no entry here. Auto-commits are internal bookkeeping,
+   * squashed out of explicit history -- the worktree's reported head is untouched, and a later
+   * explicit commit parents on that head, never on an auto-commit. Worktree *content* is
+   * stripped from client deliveries, but this field is not a content-fetch trigger (unlike a
+   * `pins` entry) and rides along untouched.
    */
   worktreePins?: {worktreeId: WorkpieceId, baseCommit: string}[];
 } | {
@@ -3272,8 +3282,11 @@ export type AiToolCall = {
    * `createdWorktrees` on the "changes" message body), like createGadget's.
    *
    * `baseCommit` is the full oid `input.commitId` resolved to -- the commit the worktree is
-   * rooted (and born pinned) at. Recorded because replay needs it to serve reads of untouched
-   * files lazily from the base tree, and the input may be a prefix.
+   * rooted at, and its accepted commit until the chat's first accept of changes to it. Recorded
+   * because the input may be a prefix and the model is told the resolved oid. The creation pins
+   * nothing: the worktree reads as its accepted commit until its first modification pins it
+   * (see ChatGadgetPin), so replay serves untouched files from the pin when there is one and
+   * from the accepted commit otherwise, never from this field.
    */
   output?: {worktreeId: WorkpieceId, changeId?: number, baseCommit: string};
 } | {

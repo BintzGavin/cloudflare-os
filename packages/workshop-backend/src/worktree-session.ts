@@ -58,9 +58,10 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     super();
   }
 
-  // The chat pin's base commit: what the current epoch's overlay is expressed against.
+  // The base commit the overlay is expressed against: the chat pin's base while the worktree is
+  // pinned, else its accepted commit (see WorktreeTurnAccess.getBaseCommit).
   #pinBase(): string {
-    let base = this.turn.getPinBase(this.worktreeId);
+    let base = this.turn.getBaseCommit(this.worktreeId);
     if (base === undefined) {
       throw new Error("This worktree is not part of the current session.");
     }
@@ -387,10 +388,11 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       timestamp: new Date(),
     });
 
-    // The chat's pin, the record's pinBase, and the epoch's rows are all deliberately
-    // untouched: the rows remain the single durable record of the overlay, so replaying them
-    // on top of the unchanged pin cannot double-apply. Only the head advances -- in memory now,
-    // durably at the step's barrier (see WorktreeTurnAccess.appendCommit).
+    // The record's pinBase and the epoch's rows are deliberately untouched: the rows remain the
+    // single durable record of the overlay, so replaying them on top of the unchanged base
+    // cannot double-apply. Only the head advances -- in memory now, durably at the step's
+    // barrier (see WorktreeTurnAccess.appendCommit) -- and a worktree not yet pinned in the
+    // chat pins at its (unchanged) base, so the advancement is a revertable proposed change.
     this.turn.appendCommit(this.worktreeId, commit, previousHead);
     return commit;
   }
