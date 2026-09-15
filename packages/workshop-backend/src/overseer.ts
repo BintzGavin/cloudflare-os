@@ -2824,12 +2824,6 @@ class OverseerImpl implements AgentHooks {
     return meta.codeBase ?? {pins: [], generation: 0, revision: 0};
   }
 
-  // AgentHooks implementation: the chat's current code base, whose pins list the gadgets whose
-  // content lives in the chat's change stream.
-  getChatCodeBase(chatId: number): ChatCodeBase | undefined {
-    return this.storage.chatMeta.get(chatId)?.codeBase;
-  }
-
   // AgentHooks implementation: the gadget's current head commit, or undefined if it has none
   // (still pending, created outside chats and never accepted, or deleted). Worktrees have no
   // mainline head -- their `headCommit` is a different notion -- so this reports undefined for
@@ -2853,20 +2847,34 @@ class OverseerImpl implements AgentHooks {
   }
 
   // AgentHooks implementation: lazily read one file of a commit's tree (see
-  // WorkspaceGitCache.readFileAtCommitIfExists) -- the base resolver behind worktree reads.
+  // WorkspaceGitCache.readFileAtCommitIfExists) -- the base resolver behind worktree reads and
+  // the way unpinned gadget reads are served too.
   readFileAtCommit(commit: string, path: string): Promise<string | undefined> {
     return this.gitCache.readFileAtCommitIfExists(commit, path);
+  }
+
+  // AgentHooks implementation: the same read, plus the blob's oid for the read's stamp.
+  readFileAtCommitWithOid(commit: string, path: string)
+      : Promise<{text: string, oid: string} | undefined> {
+    return this.gitCache.readFileAtCommitWithOid(commit, path);
+  }
+
+  // AgentHooks implementation: a regular file's blob oid by path (see
+  // WorkspaceGitCache.fileOidAtCommit), for the agent's read-freshness comparisons.
+  fileOidAtCommit(commit: string, path: string): Promise<string | undefined> {
+    return this.gitCache.fileOidAtCommit(commit, path);
+  }
+
+  // AgentHooks implementation: a blob by oid as text (see WorkspaceGitCache.readTextBlob). A
+  // stamped read's blob was pulled by the read itself, so this is a local read.
+  readBlobText(oid: string, path: string): Promise<string> {
+    return this.gitCache.readTextBlob(oid, undefined, path);
   }
 
   // AgentHooks implementation: the write side of the tree-entry modes rules (see
   // WorkspaceGitCache.assertWorktreePathWritable).
   assertWorktreePathWritable(commit: string, path: string): Promise<void> {
     return this.gitCache.assertWorktreePathWritable(commit, path);
-  }
-
-  // AgentHooks implementation: per-file oid diff between two commits (see GitStore.changedPaths).
-  changedPaths(a: string | undefined, b: string | undefined): Promise<Set<string>> {
-    return this.gitStore.changedPaths(a, b);
   }
 
   // Rebuild a chat's content -- `gadgetId -> (path -> text)` for every gadget whose files live

@@ -11,7 +11,7 @@ import {
   WorkspaceGitCache,
   gitObjectMetadataCollection,
 } from "../src/git-cache";
-import { GitStore, gitObjectsCollection } from "../src/git-store";
+import { GitStore, blobOid, gitObjectsCollection } from "../src/git-store";
 import {
   buildPackBytes,
   concatBytes,
@@ -24,6 +24,7 @@ import {
 import {
   BAD_NAME_TREE,
   COMMIT_1,
+  COMMIT_2,
   COMMIT_3,
   FIXTURE_OBJECTS,
   GITLINK_TARGET,
@@ -1195,6 +1196,35 @@ describe("worktree read/write helpers", () => {
         .rejects.toThrow("link.md is a symlink to README.md");
     await expect(t.cache.readFileAtCommitIfExists(COMMIT_1, "vendored"))
         .rejects.toThrow("vendored is a submodule");
+  });
+
+  it("readFileAtCommitWithOid / fileOidAtCommit report the blob's content address", async () => {
+    let t = makeCache();
+    t.sources.set(G1, fixtureSource(t, G1));
+    await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_1).payload);
+
+    // The read's oid is the content's address: computable from the text alone, and equal to
+    // what fileOidAtCommit reports for the same path -- with no blob read on that side.
+    let read = (await t.cache.readFileAtCommitWithOid(COMMIT_1, "README.md"))!;
+    expect(read.text).toBe("# Fixture\n");
+    expect(read.oid).toBe(await blobOid(read.text));
+    expect(await t.cache.fileOidAtCommit(COMMIT_1, "README.md")).toBe(read.oid);
+    expect(t.pulls.some(pull => pull.oids.includes(read.oid))).toBe(true);  // the read pulled it
+    let main = (await t.cache.fileOidAtCommit(COMMIT_1, "src/main.js"))!;
+    expect(t.pulls.some(pull => pull.oids.includes(main))).toBe(false);  // the blob: never read
+    expect(t.cache.hasLocalObject(main)).toBe(false);
+
+    // Commit 2 rewrote README.md and left src/main.js alone: the freshness question an edit
+    // asks, answered per file by oid equality.
+    await t.cache.putFromGatekeeper(G1, "commit", fixture(COMMIT_2).payload);
+    expect(await t.cache.fileOidAtCommit(COMMIT_2, "README.md")).not.toBe(read.oid);
+    expect(await t.cache.fileOidAtCommit(COMMIT_2, "src/main.js")).toBe(main);
+
+    // Only regular files have an oid here: absent, directory, symlink, gitlink are undefined.
+    for (let path of ["nope.txt", "src", "link.md", "vendored"]) {
+      expect(await t.cache.fileOidAtCommit(COMMIT_1, path)).toBeUndefined();
+    }
+    expect(await t.cache.readFileAtCommitWithOid(COMMIT_1, "nope.txt")).toBeUndefined();
   });
 
   it("assertWorktreePathWritable rejects symlink, gitlink, and directory paths, passes the rest",

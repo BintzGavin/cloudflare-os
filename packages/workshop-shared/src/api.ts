@@ -3145,10 +3145,19 @@ export type AiToolCall = {
   /**
    * Present when the read was served from committed code rather than the chat's uncommitted
    * content: the workpiece was not pinned in the chat (see ChatGadgetPin), so the agent read the
-   * file at the mainline head commit recorded here. History replay uses this to detect
-   * staleness: if the file has since changed, the read's content is elided from the model's
-   * context and the agent is told to re-read. Reads of pinned workpieces come from the chat's
-   * content, which cannot go stale within an epoch, and carry no stamp.
+   * file at its head -- a gadget's mainline head, a worktree's accepted commit -- and this is
+   * the blob oid of the content it saw. History replay reproduces the read's exact text from
+   * it, whatever the head holds now, and the agent's read-before-edit gate compares it against
+   * the file's oid at the head an edit is about to pin at, refusing an edit anchored to content
+   * another chat has since changed. Reads of pinned workpieces come from the chat's content,
+   * which cannot go stale within an epoch, and carry no stamp.
+   */
+  observedOid?: string;
+
+  /**
+   * No longer written; honored when read. Before reads were stamped with the blob's oid
+   * (`observedOid`), an unpinned read recorded the commit it read at; replay resolves the file's
+   * blob from it by path.
    */
   observedCommit?: string;
 } | {

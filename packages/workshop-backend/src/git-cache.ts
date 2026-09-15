@@ -547,6 +547,16 @@ export class WorkspaceGitCache {
    * change's own validation error), while the throwing errors describe the file itself.
    */
   async readFileAtCommitIfExists(commitOid: GitOid, path: string): Promise<string | undefined> {
+    return (await this.readFileAtCommitWithOid(commitOid, path))?.text;
+  }
+
+  /**
+   * `readFileAtCommitIfExists` that also reports the blob's oid -- the file's content address,
+   * which a later `fileOidAtCommit` on another commit compares equal iff the content is
+   * byte-identical. Same rules and errors otherwise.
+   */
+  async readFileAtCommitWithOid(commitOid: GitOid, path: string)
+      : Promise<{ text: string, oid: GitOid } | undefined> {
     let { tree, entry } = await this.#resolveEntryAt(commitOid, path);
     if (entry === undefined || entry.mode === "40000") return undefined;
     switch (entry.mode) {
@@ -556,8 +566,20 @@ export class WorkspaceGitCache {
         // The symlink target *is* the blob's content, so the error tells the agent everything.
         throw new Error(symlinkMessage(path, await this.#readBlob(entry.oid, tree, path)));
       default:
-        return decodeBlobText(await this.#readBlob(entry.oid, tree, path), path);
+        return { text: decodeBlobText(await this.#readBlob(entry.oid, tree, path), path),
+                 oid: entry.oid };
     }
+  }
+
+  /**
+   * The blob oid of the regular file at `path` in a commit's tree, or undefined when the path is
+   * absent or names anything else (directory, symlink, gitlink). Walks only the trees along the
+   * path and never reads the blob, so it answers "is this file still the content I saw?" -- by
+   * comparison with a stamp from `readFileAtCommitWithOid` or `blobOid` -- at tree-walk cost.
+   */
+  async fileOidAtCommit(commitOid: GitOid, path: string): Promise<GitOid | undefined> {
+    let { entry } = await this.#resolveEntryAt(commitOid, path);
+    return entry?.mode === "100644" || entry?.mode === "100755" ? entry.oid : undefined;
   }
 
   /**
@@ -742,8 +764,7 @@ export class WorkspaceGitCache {
   /**
    * The set of paths whose non-directory entry differs between two commits' trees (added,
    * removed, or changed in oid or mode), walking only differing subtrees and fault-pulling
-   * whatever is missing -- the lazy, worktree-scale sibling of `GitStore.changedPaths`. Blob
-   * content is never read. Symlink and gitlink entries are reported like files (callers render
+   * whatever is missing. Blob content is never read. Symlink and gitlink entries are reported like files (callers render
    * them with their descriptive errors), and a name that is a file on one side and a directory
    * on the other contributes both the file path and the directory's differing contents.
    */
@@ -878,9 +899,11 @@ export class WorkspaceGitCache {
    * Reads a blob as UTF-8 text under the file-content rules every worktree read applies --
    * UnreadableContentError, path-flavored, for oversized or binary content -- fault-pulling the
    * blob on a miss (`referencedBy` shapes the pull hints; `path` names the file in errors).
-   * For batch callers (grep) that ensured the blobs beforehand, this is a local read.
+   * For batch callers (grep) that ensured the blobs beforehand -- and for re-reading a blob an
+   * earlier read already pulled, where no referencing object is known -- this is a local read.
    */
-  async readTextBlob(oid: GitOid, referencedBy: GitOid, path: string): Promise<string> {
+  async readTextBlob(oid: GitOid, referencedBy: GitOid | undefined, path: string)
+      : Promise<string> {
     return decodeBlobText(await this.#readBlob(oid, referencedBy, path), path);
   }
 
@@ -913,7 +936,8 @@ export class WorkspaceGitCache {
   }
 
   // Reads a blob for a file path, translating unavailable-at-size into the path-specific error.
-  async #readBlob(oid: GitOid, referencedBy: GitOid, path: string): Promise<Uint8Array> {
+  async #readBlob(oid: GitOid, referencedBy: GitOid | undefined, path: string)
+      : Promise<Uint8Array> {
     let blob: PackableObject;
     try {
       blob = await this.ensureObject(oid, { type: "blob", referencedBy });
