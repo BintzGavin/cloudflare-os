@@ -24,12 +24,7 @@ import type {
 import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
 import { diffFiles, type FileChange } from "@gadgets/workshop-shared/code-change";
 import type { GitOid } from "@gadgets/workshop-shared/gatekeeper";
-import {
-  GitObjectTooLargeError,
-  MAX_GIT_OBJECT_SIZE,
-  UnreadableContentError,
-  type WorkspaceGitCache,
-} from "./git-cache";
+import { UnreadableContentError, type WorkspaceGitCache } from "./git-cache";
 import { commitIdentityForAuthor, type GitStore } from "./git-store";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
 
@@ -309,33 +304,18 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     // One batched fetch for every missing base blob, across all scopes. Paths with identical
     // content share one blob oid, so each oid maps to every path holding it: an oversized blob
     // then notes each of those files, keeping the one-error-per-skipped-file promise.
-    let missing = new Map<GitOid, string[]>();
+    let pathsByOid = new Map<GitOid, string[]>();
     for (let candidate of candidates.values()) {
-      if (candidate.oid !== undefined && !this.host.gitCache.hasLocalObject(candidate.oid)) {
-        let missingPaths = missing.get(candidate.oid);
-        if (missingPaths === undefined) missing.set(candidate.oid, missingPaths = []);
-        missingPaths.push(candidate.path);
+      if (candidate.oid !== undefined) {
+        let oidPaths = pathsByOid.get(candidate.oid);
+        if (oidPaths === undefined) pathsByOid.set(candidate.oid, oidPaths = []);
+        oidPaths.push(candidate.path);
       }
     }
-    let skipped = new Set<GitOid>();
-    while (missing.size > 0) {
-      try {
-        await this.host.gitCache.ensureGitObjects([...missing.keys()], {
-          type: "blob",
-          commitHistory: { kind: "depth", depth: 1 },
-          filterBlobSize: MAX_GIT_OBJECT_SIZE + 1,
-        });
-        break;
-      } catch (err) {
-        if (err instanceof GitObjectTooLargeError && missing.has(err.oid)) {
-          for (let missingPath of missing.get(err.oid)!) {
-            errorByFile.set(missingPath, `${missingPath} is too large to read`);
-          }
-          skipped.add(err.oid);
-          missing.delete(err.oid);
-          continue;  // retry the rest of the batch (already-pulled blobs are skipped)
-        }
-        throw err;
+    let skipped = await this.host.gitCache.ensureBlobs(pathsByOid.keys());
+    for (let oid of skipped) {
+      for (let skippedPath of pathsByOid.get(oid)!) {
+        errorByFile.set(skippedPath, `${skippedPath} is too large to read`);
       }
     }
 

@@ -26,10 +26,11 @@
 // the ancestry rule are a mistake-safeguard and a simulation aid -- they fail an *accidental*
 // push to an unrelated remote closed at queue time -- not defenses against a hostile gatekeeper.
 //
-// The lazy read paths here (`ensureObject`, `readFileAtCommit`, `listTreeEntries`) parse git
-// objects via the hand-rolled codec (git-codec.ts) rather than isomorphic-git, because each step
-// must know the expected type and the referencing object to shape `GitPullHints`. Writes never
-// fault and stay in git-store.ts on isomorphic-git.
+// The lazy read paths here (`ensureObject`, `readFileAtCommit`, `listTreeEntries`,
+// `readCommitTree`, `readFilesAtCommit`) parse git objects via the hand-rolled codec
+// (git-codec.ts) rather than isomorphic-git, because each step must know the expected type and
+// the referencing object to shape `GitPullHints`. Writes never fault and stay in git-store.ts on
+// isomorphic-git.
 
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
@@ -40,7 +41,12 @@ import type {
   GitOid,
   GitPullHints,
 } from "@gadgets/workshop-shared/gatekeeper";
-import type { WorkpieceId } from "@gadgets/workshop-shared/api";
+import {
+  READ_FILES_RESPONSE_BUDGET,
+  type FileAtCommit,
+  type TreeNode,
+  type WorkpieceId,
+} from "@gadgets/workshop-shared/api";
 import type { GitObjectRecord } from "./git-store";
 import {
   buildPackBytes,
@@ -238,6 +244,17 @@ export interface GitTreePathEntry {
   path: string;
   kind: GitTreeEntryKind;
   oid: GitOid;
+}
+
+/** The entry at one path of a commit's tree, as resolved by `pathEntryAtCommit()`. */
+export interface GitPathEntry {
+  kind: GitTreeEntryKind;
+  oid: GitOid;
+  /**
+   * The object whose payload holds the entry -- its containing tree, or the commit itself for
+   * the root -- the hint a later read of the entry's object should carry.
+   */
+  referencedBy: GitOid;
 }
 
 const MODE_KINDS: Record<GitTreeEntry["mode"], GitTreeEntryKind> = {
@@ -534,12 +551,10 @@ export class WorkspaceGitCache {
     if (entry === undefined || entry.mode === "40000") return undefined;
     switch (entry.mode) {
       case "160000":
-        throw new Error(`${path} is a submodule (gitlink) pointing at commit ${entry.oid}`);
-      case "120000": {
+        throw new Error(submoduleMessage(path, entry.oid));
+      case "120000":
         // The symlink target *is* the blob's content, so the error tells the agent everything.
-        let blob = await this.#readBlob(entry.oid, tree, path);
-        throw new Error(`${path} is a symlink to ${new TextDecoder().decode(blob)}`);
-      }
+        throw new Error(symlinkMessage(path, await this.#readBlob(entry.oid, tree, path)));
       default:
         return decodeBlobText(await this.#readBlob(entry.oid, tree, path), path);
     }
@@ -605,12 +620,9 @@ export class WorkspaceGitCache {
   /**
    * The kind and oid of the entry at `path` in a commit's tree, or undefined when the path
    * doesn't resolve. `""` names the root directory (whose oid is the root tree). Trees along the
-   * walk fault in as needed; blob content is never read. `referencedBy` is the object whose
-   * payload holds the entry -- its containing tree, or the commit itself for the root -- the
-   * hint a later read of the entry's object should carry.
+   * walk fault in as needed; blob content is never read.
    */
-  async pathEntryAtCommit(commitOid: GitOid, path: string)
-      : Promise<{ kind: GitTreeEntryKind, oid: GitOid, referencedBy: GitOid } | undefined> {
+  async pathEntryAtCommit(commitOid: GitOid, path: string): Promise<GitPathEntry | undefined> {
     if (path === "") {
       let commit = await this.ensureObject(commitOid, { type: "commit", eagerTree: true });
       return { kind: "dir", oid: parseGitCommitRefs(commit.payload, commitOid).tree,
@@ -647,6 +659,83 @@ export class WorkspaceGitCache {
       }
     };
     await walk(root.oid, root.referencedBy, scope === "" ? "" : `${scope}/`);
+    return out;
+  }
+
+  /**
+   * A commit's whole tree as nested `TreeNode`s (the client-facing shape behind
+   * `Overseer.listTree`): each directory's entries in `parseGitTree` order, names not paths, no
+   * oids. The nested sibling of `listCommitTreePaths`: the same eager-tree walk, emitting nodes
+   * instead of prefixed paths. Blob content is never read.
+   */
+  async readCommitTree(commitOid: GitOid): Promise<TreeNode[]> {
+    let commit = await this.ensureObject(commitOid, { type: "commit", eagerTree: true });
+    let walk = async (treeOid: GitOid, referencedBy: GitOid): Promise<TreeNode[]> => {
+      let tree = await this.ensureObject(treeOid, { type: "tree", referencedBy, eagerTree: true });
+      let nodes: TreeNode[] = [];
+      for (let entry of parseGitTree(tree.payload, treeOid)) {
+        let kind = MODE_KINDS[entry.mode];
+        nodes.push(kind === "dir"
+            ? { name: entry.name, kind, children: await walk(entry.oid, treeOid) }
+            : { name: entry.name, kind });
+      }
+      return nodes;
+    };
+    return walk(parseGitCommitRefs(commit.payload, commitOid).tree, commitOid);
+  }
+
+  /**
+   * The content of several files at a commit in one round trip (the read behind
+   * `Overseer.readFilesAtCommit`; see its doc for the contract). Entries resolve along the
+   * eager-tree walk, every missing blob is pulled in one batch (`ensureBlobs`), and the results
+   * come back in request order -- stopping once the accumulated blob bytes exceed
+   * READ_FILES_RESPONSE_BUDGET, so the remaining paths are simply omitted. Per-file conditions
+   * become `absent`/`unreadable` entries; a pull failure throws.
+   */
+  async readFilesAtCommit(commitOid: GitOid, paths: string[])
+      : Promise<[path: string, FileAtCommit][]> {
+    let entries = new Map<string, GitPathEntry | undefined>();
+    for (let path of paths) {
+      if (!entries.has(path)) entries.set(path, await this.pathEntryAtCommit(commitOid, path));
+    }
+    // Symlink blobs are fetched too: the target *is* the blob, and it names the link in the
+    // unreadable message, as every other read of a symlink does.
+    let blobs: GitOid[] = [];
+    for (let entry of entries.values()) {
+      if (entry !== undefined && entry.kind !== "dir" && entry.kind !== "submodule") {
+        blobs.push(entry.oid);
+      }
+    }
+    let tooLarge = await this.ensureBlobs(blobs);
+
+    let out: [path: string, FileAtCommit][] = [];
+    let bytes = 0;
+    for (let path of paths) {
+      if (bytes > READ_FILES_RESPONSE_BUDGET) break;
+      let entry = entries.get(path);
+      if (entry === undefined || entry.kind === "dir") {
+        out.push([path, { absent: true }]);
+      } else if (entry.kind === "submodule") {
+        out.push([path, { unreadable: submoduleMessage(path, entry.oid) }]);
+      } else if (tooLarge.has(entry.oid)) {
+        out.push([path, { unreadable: tooLargeMessage(path) }]);
+      } else {
+        try {
+          // Local by now (ensureBlobs), so this is a decode, not a fault.
+          let payload = await this.#readBlob(entry.oid, entry.referencedBy, path);
+          if (entry.kind === "symlink") {
+            out.push([path, { unreadable: symlinkMessage(path, payload) }]);
+          } else {
+            let text = decodeBlobText(payload, path);
+            bytes += payload.byteLength;
+            out.push([path, { text }]);
+          }
+        } catch (err) {
+          if (!(err instanceof UnreadableContentError)) throw err;
+          out.push([path, { unreadable: err.message }]);
+        }
+      }
+    }
     return out;
   }
 
@@ -716,11 +805,10 @@ export class WorkspaceGitCache {
     let { tree, entry } = await this.#resolveEntryAt(commitOid, path);
     if (entry?.mode === "120000") {
       // The target is the blob's content; the message tells the agent everything (same as reads).
-      let blob = await this.#readBlob(entry.oid, tree, path);
-      throw new Error(`${path} is a symlink to ${new TextDecoder().decode(blob)}`);
+      throw new Error(symlinkMessage(path, await this.#readBlob(entry.oid, tree, path)));
     }
     if (entry?.mode === "160000") {
-      throw new Error(`${path} is a submodule (gitlink) pointing at commit ${entry.oid}`);
+      throw new Error(submoduleMessage(path, entry.oid));
     }
     if (entry?.mode === "40000") {
       throw new Error(`${path} is a directory`);
@@ -796,6 +884,34 @@ export class WorkspaceGitCache {
     return decodeBlobText(await this.#readBlob(oid, referencedBy, path), path);
   }
 
+  /**
+   * Ensures a batch of blobs is locally present in one pull (retried minus each blob that
+   * proves oversized), for readers that then decode them locally (`readTextBlob`/`#readBlob`
+   * on a present blob never faults). Returns the oids that could not be obtained because they
+   * exceed MAX_GIT_OBJECT_SIZE -- measured, or omitted by the pull's own blob filter -- so the
+   * caller can report each affected path instead of failing the batch. Every other failure
+   * throws. Never a serial walk-and-fetch: this is the reason batch readers gather their oids
+   * first.
+   */
+  async ensureBlobs(oids: Iterable<GitOid>): Promise<Set<GitOid>> {
+    let missing = new Set([...oids].filter(oid => !this.hasLocalObject(oid)));
+    let tooLarge = new Set<GitOid>();
+    while (missing.size > 0) {
+      try {
+        await this.ensureGitObjects([...missing], this.#exactObjectHints("blob"));
+        break;
+      } catch (err) {
+        if (err instanceof GitObjectTooLargeError && missing.has(err.oid)) {
+          tooLarge.add(err.oid);
+          missing.delete(err.oid);
+          continue;  // retry the rest of the batch (already-pulled blobs are skipped)
+        }
+        throw err;
+      }
+    }
+    return tooLarge;
+  }
+
   // Reads a blob for a file path, translating unavailable-at-size into the path-specific error.
   async #readBlob(oid: GitOid, referencedBy: GitOid, path: string): Promise<Uint8Array> {
     let blob: PackableObject;
@@ -803,15 +919,13 @@ export class WorkspaceGitCache {
       blob = await this.ensureObject(oid, { type: "blob", referencedBy });
     } catch (err) {
       if (err instanceof GitObjectTooLargeError) {
-        throw new UnreadableContentError(
-            `${path} is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)`, { cause: err });
+        throw new UnreadableContentError(tooLargeMessage(path), { cause: err });
       }
       throw err;
     }
     if (blob.payload.byteLength > MAX_GIT_OBJECT_SIZE) {
       // Locally-present but over the cap (e.g. written before the cap existed).
-      throw new UnreadableContentError(
-          `${path} is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)`);
+      throw new UnreadableContentError(tooLargeMessage(path));
     }
     return blob.payload;
   }
@@ -1193,6 +1307,21 @@ function addUnique<T>(array: T[], value: T): boolean {
   if (array.includes(value)) return false;
   array.push(value);
   return true;
+}
+
+// The path-flavored descriptions of the three entry shapes that have no readable text. Shared
+// by the throwing reads (the message is the error) and readFilesAtCommit (it is the
+// `unreadable` entry), so both surfaces say the same thing.
+function symlinkMessage(path: string, target: Uint8Array): string {
+  return `${path} is a symlink to ${new TextDecoder().decode(target)}`;
+}
+
+function submoduleMessage(path: string, target: GitOid): string {
+  return `${path} is a submodule (gitlink) pointing at commit ${target}`;
+}
+
+function tooLargeMessage(path: string): string {
+  return `${path} is too large to read (over ${MAX_GIT_OBJECT_SIZE} bytes)`;
 }
 
 // Decodes a blob's payload as strict UTF-8 text, throwing the path-flavored
