@@ -6,16 +6,16 @@ import type { CodeChange, FileChange, TextChange } from '@gadgets/workshop-share
 import { RpcStub } from 'capnweb'
 import FileSidebar from './FileSidebar'
 import type { FileChangeStatus, FileSidebarHandle } from './FileSidebar'
-import { WorkshopButton, WorkshopIconButton } from './components/WorkshopControls'
+import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
 import type {
   ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
-} from './ChatInterface'
+} from '../../ChatInterface'
 import { ChatOtClient, type RemoteFileEvent } from './otClient'
-import { reportIssue } from './errorReporting'
-import { saveTextToFile } from './fileTransfers'
-import { isTransientRpcError } from './rpcErrors'
+import { reportIssue } from '../../errorReporting'
+import { saveTextToFile } from '../../fileTransfers'
+import { isTransientRpcError } from '../../rpcErrors'
 
 // The code view over git-backed gadget code.
 //

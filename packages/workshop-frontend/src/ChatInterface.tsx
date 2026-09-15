@@ -84,7 +84,7 @@ import {
   MessageFormatRef,
 } from "@gadgets/workshop-shared/api";
 import { composeCodeChange, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import type { ChatChangeRow } from "./otClient";
+import type { ChatChangeRow } from "./features/code/otClient";
 import { ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
   useSlashCommandChoice, type OverseerSource,

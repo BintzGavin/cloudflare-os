@@ -11,9 +11,9 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import type { FileChange, TextChange } from '@gadgets/workshop-shared/code-change'
-import { codeEditorTheme, monoFont } from './components/codeTheme'
+import { codeEditorTheme, monoFont } from './codeTheme'
 import { getLanguage } from './getLanguage'
-import { useTheme } from './ThemeContext'
+import { useTheme } from '../../ThemeContext'
 
 // The code view's plain editor: CodeMirror 6, either read-only (the committed head view) or
 // bound to the chat's OT client through an EditSession. In-chat diff presentation lives in
