@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { MAX_READ_FILES_PER_CALL, type FileAtCommit, type TreeNode }
   from '@gadgets/workshop-shared/api'
-import { CommitFileStore, flattenTreePaths, type CommitFileReader } from './commitFileStore'
+import { CommitFileStore, type CommitFileReader } from './commitFileStore'
 
 // A fake Overseer that records every call. `budget` caps how many entries one readFilesAtCommit
 // call answers, standing in for the server's response byte budget (which omits the rest).
@@ -147,18 +147,3 @@ describe('CommitFileStore', () => {
   })
 })
 
-describe('flattenTreePaths', () => {
-  it('joins names down each branch, preserving git order', () => {
-    const tree: TreeNode[] = [
-      { name: 'README', kind: 'file' },
-      { name: 'bin', kind: 'dir', children: [{ name: 'run', kind: 'executable' }] },
-      { name: 'src', kind: 'dir', children: [
-        { name: 'lib', kind: 'dir', children: [{ name: 'x.ts', kind: 'file' }] },
-        { name: 'main.ts', kind: 'file' },
-      ] },
-      { name: 'vendor', kind: 'submodule' },
-    ]
-    expect(flattenTreePaths(tree))
-      .toEqual(['README', 'bin/run', 'src/lib/x.ts', 'src/main.ts', 'vendor'])
-  })
-})

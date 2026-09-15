@@ -3719,15 +3719,20 @@ export type ConsoleLogEvent = {
 }
 
 /**
- * Summary of one workpiece, delivered via Overseer.subscribeToWorkpieces(). In v1 only
- * gadget-type workpieces are published (gatekeeper workpieces -- chat capsules, ambient
- * singletons, connections -- are not listed); `type` discriminates for future workpiece types.
+ * Summary of one workpiece, delivered via Overseer.subscribeToWorkpieces(), discriminated by
+ * `type`. Gadgets and worktrees are published (gatekeeper workpieces -- chat capsules, ambient
+ * singletons, connections -- are not listed). Worktrees are published only to subscriptions that
+ * include pending workpieces (build role): like a pending gadget, a worktree belongs to one chat
+ * (its `chatId` is always set) and the UI shows it only while that chat is selected.
  */
-export type WorkpieceSummary = {
+export type WorkpieceSummary = GadgetSummary | WorktreeSummary;
+
+/** The WorkpieceSummary of a gadget: an app built from code, with a committed mainline head. */
+export type GadgetSummary = {
   id: WorkpieceId;
   type: "gadget";
 
-  /** Display title. (For a gadget, its user-renamable title.) */
+  /** Display title: the gadget's user-renamable title. */
   title: string;
 
   /**
@@ -3755,6 +3760,48 @@ export type WorkpieceSummary = {
    * reverted (or the chat is deleted).
    */
   chatId?: number;
+};
+
+/**
+ * The WorkpieceSummary of a worktree: a checkout of an external git repository that an agent
+ * works in (see AiChatMessageBody.createdWorktrees). It has no app and no bindings; the UI shows
+ * only its code. Its three commits are the worktree's state as the chat sees it; the OT rows of
+ * the chat's current epoch compose on `pinBase`.
+ */
+export type WorktreeSummary = {
+  id: WorkpieceId;
+  type: "worktree";
+
+  /** Display title: the name the worktree was created under. */
+  title: string;
+
+  /**
+   * The chat this worktree belongs to, for its whole life (a worktree is never shared across
+   * chats). Always set: the UI displays the worktree only while this chat is selected, as it
+   * does a pending gadget, and the worktree is deleted with the chat.
+   */
+  chatId: number;
+
+  /**
+   * The accepted commit (40-hex hash): the worktree's content as of the chat's last accept, and
+   * the worktree analog of a gadget's `commitId`. While the worktree is unpinned in its chat, its
+   * content reads as this commit's tree (via Overseer.listTree()/readFilesAtCommit()), and a
+   * client's pin declaration (CodeChangeSubmission.pins) is accepted iff its `baseCommit` equals
+   * this. Advances when the chat's changes are accepted (to the accept's auto-commit of the
+   * changed content); subscribeToWorkpieces() delivers a fresh entry() whenever it does.
+   */
+  pinBase: string;
+
+  /**
+   * The last explicit commit the agent made (initially `baseCommit`): what the worktree's own
+   * API reports as HEAD. Header display only -- it plays no role in what the UI shows as changed,
+   * which is always relative to `pinBase`. Re-delivered whenever it advances, and rolled back
+   * with the changes that advanced it when they are reverted.
+   */
+  headCommit: string;
+
+  /** The commit the worktree was created at. Immutable; informational. */
+  baseCommit: string;
 };
 
 /** Callback interface used to receive workpiece-list updates. See Overseer.subscribeToWorkpieces(). */

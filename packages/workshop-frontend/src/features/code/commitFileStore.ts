@@ -155,13 +155,3 @@ export class CommitFileStore {
 /** The page-wide store (see the module comment). */
 export const commitFileStore = new CommitFileStore()
 
-/** Flatten a nested tree to its leaf entries' `/`-joined paths (git order preserved). */
-export function flattenTreePaths(nodes: readonly TreeNode[], prefix = ''): string[] {
-  const out: string[] = []
-  for (const node of nodes) {
-    const path = prefix + node.name
-    if (node.kind === 'dir') out.push(...flattenTreePaths(node.children, path + '/'))
-    else out.push(path)
-  }
-  return out
-}

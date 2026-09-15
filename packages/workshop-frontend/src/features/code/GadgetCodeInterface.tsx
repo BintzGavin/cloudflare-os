@@ -1,13 +1,14 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { DownloadSimple, List } from '@phosphor-icons/react'
-import type { FileAtCommit, Overseer, WorkpieceId } from '@gadgets/workshop-shared/api'
+import type {
+  FileAtCommit, Overseer, WorkpieceId, WorkpieceSummary,
+} from '@gadgets/workshop-shared/api'
 import {
   MAX_FILE_TEXT_LENGTH, type CodeChange, type FileChange, type TextChange,
 } from '@gadgets/workshop-shared/code-change'
 import { RpcStub } from 'capnweb'
-import FileSidebar from './FileSidebar'
-import type { FileChangeStatus, FileSidebarHandle } from './FileSidebar'
+import FileBrowser, { isOpenableKind, type FileBrowserHandle } from './FileBrowser'
 import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
@@ -15,40 +16,52 @@ import type {
   ChatCodeChanges, ChatLiveChangeRows, ChatLiveEditPreviews, EditPreviewEvent,
 } from '../../ChatInterface'
 import { ChatOtClient, type RemoteFileEvent } from './otClient'
-import { commitFileStore, flattenTreePaths, type CommitFileReader } from './commitFileStore'
+import { commitFileStore, type CommitFileReader } from './commitFileStore'
 import { useCommitTree, useFilesAtCommit } from './useCommitContent'
+import {
+  EMPTY_BROWSER_TREE, browserTreePaths, buildBrowserTree, deriveChanges, type ChangedFile,
+  type FileChangeStatus,
+} from './workpieceTree'
 import { reportIssue } from '../../errorReporting'
 import { saveTextToFile } from '../../fileTransfers'
 import { isTransientRpcError } from '../../rpcErrors'
 
-// The code view over git-backed gadget code.
+// The code view over a workpiece's git-backed files -- a gadget's code or a worktree's checkout.
+// The two differ here in exactly two places: which summary field names the *accepted commit*
+// (a gadget's `commitId`, a worktree's `pinBase`; see acceptedCommitOf), and what the workpiece
+// is called in copy. Everything else is one code path.
 //
-// Committed code is git commits, read lazily through the per-commit file store (see
-// commitFileStore.ts): Overseer.listTree() for a commit's file list, Overseer.readFilesAtCommit()
+// Committed content is git commits, read lazily through the per-commit file store (see
+// commitFileStore.ts): Overseer.listTree() for a commit's tree, Overseer.readFilesAtCommit()
 // for content by path, both immutable and cached by oid. Two commits matter here and are kept
 // apart:
 //  - The *content base* is what the chat's content is built on: the chat pin's base commit when
-//    the gadget is pinned in the selected chat, else its head. The file list, an untouched
-//    file's text, and the seed for a local edit all come from it -- what the agent reads.
+//    the workpiece is pinned in the selected chat, else the accepted commit. The tree, an
+//    untouched file's text, and the seed for a local edit all come from it -- what the agent
+//    reads.
 //  - The *review base* is what "changed" means: the diff's original side and the statuses are
 //    computed against it. It is the pin's `mergedCommit` -- the mainline commit whose content
-//    has been merged into the chat -- else head. That is exactly what accepting would apply:
-//    a chat not updated from mainline diffs against its pin, so mainline's later commits never
-//    show up (accepting doesn't revert them, it is blocked until they are merged in); once
-//    updateChatFromMainline has imported them as rows, `mergedCommit` has advanced past the
-//    pin and those rows compare equal and vanish, rather than being listed as this chat's own
-//    changes. Accept requires `mergedCommit === head`, so where it is enabled the two agree.
-// The two coincide except for a chat that has been updated from mainline.
+//    has been merged into the chat -- else the accepted commit. That is exactly what accepting
+//    would apply: a chat not updated from mainline diffs against its pin, so mainline's later
+//    commits never show up (accepting doesn't revert them, it is blocked until they are merged
+//    in); once updateChatFromMainline has imported them as rows, `mergedCommit` has advanced
+//    past the pin and those rows compare equal and vanish, rather than being listed as this
+//    chat's own changes. Accept requires `mergedCommit === head`, so where it is enabled the
+//    two agree.
+// The two coincide except for a gadget chat that has been updated from mainline. For a worktree
+// they always coincide (it has no mainline), and in particular the worktree's own `headCommit`
+// -- the agent's last explicit commit -- plays no role: an agent that edits and immediately
+// commits still shows its work against the last *accepted* commit.
 //
 // A chat's uncommitted changes are a revisioned stream of code changes (see ChatCodeBase in the
 // API), tracked here by a per-chat ChatOtClient (see otClient.ts). Its content is sparse: for
-// a pinned gadget it holds only the paths the epoch touched (plus tombstones for removals), so
-// "touched" is exactly "in the client's files or removed paths", and the view reads everything
-// else from the content base. The user's edits are composed locally and submitted through
-// Overseer.submitCodeChange().
+// a pinned workpiece it holds only the paths the epoch touched (plus tombstones for removals),
+// so "touched" is exactly "in the client's files or removed paths", and the view reads
+// everything else from the content base. The user's edits are composed locally and submitted
+// through Overseer.submitCodeChange().
 //
-// A gadget not pinned in the chat tracks mainline head live. The user can start editing it
-// without any extra round trip: the editor shows the head text the store already loaded, and
+// A workpiece not pinned in the chat tracks its accepted commit live. The user can start editing
+// it without any extra round trip: the editor shows the base text the store already loaded, and
 // the first local edit seeds the client with just that path's base text and declares the pin
 // on its next submission (the first-keystroke pin flow; see ChatOtClient.ensureFileEditable).
 // If the server refuses a submission -- the chat's generation moved destructively under a
@@ -57,17 +70,13 @@ import { isTransientRpcError } from '../../rpcErrors'
 // ChatCodeBase.generation's contract. Merges don't discard anything: the client rides the
 // epoch reset (and the server's straggler bridge) seamlessly.
 //
-// There is no standalone (out-of-chat) editing: gadget heads only advance when a chat's
+// There is no standalone (out-of-chat) editing: accepted commits only advance when a chat's
 // changes are accepted.
 
 interface GadgetCodeInterfaceProps {
   overseer: RpcStub<Overseer>
-  // The selected workpiece: the gadget whose files the editor shows.
-  workpieceId: WorkpieceId
-  // The selected workpiece's head commit (WorkpieceSummary.commitId): the content and review
-  // base while the gadget is unpinned in the selected chat. Absent while the gadget is still
-  // pending in a chat, which reads as an empty committed file set.
-  headCommitId?: string
+  // The selected workpiece, whose files the editor shows.
+  summary: WorkpieceSummary
   height?: string | number
   selectedChatId?: number | null
   // The selected chat's durable code state (see ChatCodeChanges): its ChatCodeBase plus the
@@ -92,6 +101,15 @@ interface GadgetCodeInterfaceProps {
 const NO_PENDING_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 const NO_PATHS: readonly string[] = []
 const NO_REMOVED: ReadonlySet<string> = new Set()
+const NO_CHANGES: readonly ChangedFile[] = []
+
+// The workpiece's accepted commit -- the content and review base while it is unpinned in the
+// selected chat. The one place the two workpiece types are told apart for content: a gadget's
+// mainline head, a worktree's last-accepted commit. Absent while a gadget is still pending in a
+// chat, which reads as an empty committed file set.
+function acceptedCommitOf(summary: WorkpieceSummary): string | undefined {
+  return summary.type === 'worktree' ? summary.pinBase : summary.commitId
+}
 
 // A file's text as the view resolves it: present, absent (deleted or never existed), or an
 // unreadable base entry (symlink, binary, oversized) shown as a read-only placeholder.
@@ -102,7 +120,7 @@ function resolvedFromCommit(file: FileAtCommit | undefined): ResolvedText | unde
   return 'text' in file ? { text: file.text } : file
 }
 
-function areArraysEqual(left: string[], right: string[]) {
+function areArraysEqual(left: readonly string[], right: readonly string[]) {
   if (left.length !== right.length) return false
   for (let i = 0; i < left.length; i++) {
     if (left[i] !== right[i]) return false
@@ -199,7 +217,7 @@ function replaceSpanTextChange(
 }
 
 export default function GadgetCodeInterface({
-  overseer, workpieceId, headCommitId, height = '100%', selectedChatId = null, chatChanges,
+  overseer, summary, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
   isVisible = true, onHasCodeChange,
 }: GadgetCodeInterfaceProps) {
@@ -207,6 +225,9 @@ export default function GadgetCodeInterface({
   const toastsRef = useRef(toasts)
   toastsRef.current = toasts
   const branchMode = selectedChatId !== null
+  const workpieceId = summary.id
+  const acceptedCommit = acceptedCommitOf(summary)
+  const workpieceNoun = summary.type === 'worktree' ? 'worktree' : 'gadget'
 
   // Keep refs to the current props so long-lived callbacks (the OT client delegate, editor
   // sessions) always read the latest values.
@@ -225,19 +246,19 @@ export default function GadgetCodeInterface({
   readerRef.current = reader
 
   // The content and review bases (see the module comment), from the selected chat's pin for
-  // this gadget, else head. Both undefined for a pending (chat-created) gadget, whose content
-  // is the overlay alone.
+  // this workpiece, else the accepted commit. Both undefined for a pending (chat-created)
+  // gadget, whose content is the overlay alone.
   const chatPin = branchMode && chatChanges !== undefined && chatChanges.chatId === selectedChatId
     ? chatChanges.codeBase?.pins.find(pin => pin.gadgetId === workpieceId)
     : undefined
-  const contentBase = chatPin?.baseCommit ?? headCommitId
+  const contentBase = chatPin?.baseCommit ?? acceptedCommit
   const contentBaseRef = useRef(contentBase)
   contentBaseRef.current = contentBase
-  const reviewBase = chatPin?.mergedCommit ?? headCommitId
+  const reviewBase = chatPin?.mergedCommit ?? acceptedCommit
 
-  // The content base's file list. A failed fetch renders an error state with a retry (the
-  // store evicts failures, so bumping the token genuinely refetches); without it the pane
-  // would sit in its loading state forever.
+  // The content base's tree. A failed fetch renders an error state with a retry (the store
+  // evicts failures, so bumping the token genuinely refetches); without it the pane would sit
+  // in its loading state forever.
   const [treeRetryToken, setTreeRetryToken] = useState(0)
   const { tree: baseTree, error: treeError } = useCommitTree(reader, contentBase, treeRetryToken)
   useEffect(() => {
@@ -245,9 +266,6 @@ export default function GadgetCodeInterface({
     console.error('Failed to load committed code:', treeError)
     reportIssue('code-view.commit-tree', treeError, { handled: true })
   }, [treeError])
-  // Flattened to paths for the (flat) file list: null while the tree is loading.
-  const basePaths: readonly string[] | null = useMemo(
-    () => (baseTree !== null ? flattenTreePaths(baseTree) : null), [baseTree])
 
   // ---- OT client (one per selected chat) --------------------------------------------------
 
@@ -802,23 +820,24 @@ export default function GadgetCodeInterface({
     return undefined
   }
 
-  // An unpinned gadget's editor shows head content; when the head advances (another chat's
-  // accept), open editors must reload from the new base.
-  const prevUnpinnedHeadRef = useRef(headCommitId)
+  // An unpinned workpiece's editor shows the accepted commit's content; when that advances (a
+  // gadget: another chat's accept; a worktree: this chat's), open editors must reload from the
+  // new base.
+  const prevUnpinnedBaseRef = useRef(acceptedCommit)
   useEffect(() => {
     if (!clientReady) return
-    if (!client!.hasGadget(workpieceId) && prevUnpinnedHeadRef.current !== headCommitId) {
+    if (!client!.hasGadget(workpieceId) && prevUnpinnedBaseRef.current !== acceptedCommit) {
       setResetToken(token => token + 1)
     }
-    prevUnpinnedHeadRef.current = headCommitId
-  }, [client, clientReady, headCommitId, workpieceId])
+    prevUnpinnedBaseRef.current = acceptedCommit
+  }, [client, clientReady, acceptedCommit, workpieceId])
 
   // ---- file selection ----------------------------------------------------------------------
 
   const [activeFile, setActiveFile] = useState<string | null>(null)
   const [fileDrawerOpen, setFileDrawerOpen] = useState(false)
   const [compactLayout, setCompactLayout] = useState(false)
-  const fileSidebarRef = useRef<FileSidebarHandle | null>(null)
+  const fileBrowserRef = useRef<FileBrowserHandle | null>(null)
   const fileDrawerRef = useRef<HTMLDivElement | null>(null)
   const fileDrawerTriggerRef = useRef<HTMLButtonElement | null>(null)
 
@@ -923,56 +942,90 @@ export default function GadgetCodeInterface({
   const { files: activeBaseFiles, error: activeBaseError } =
     useFilesAtCommit(reader, contentBase, activeBasePaths, fileRetryToken)
 
-  // Sorted list of files the view shows: the content base's files less the chat's removals,
-  // plus the chat's and the previews' files (which may be mid-creation). A removed file that
-  // exists at the review base stays listed (marked "deleted") so its removal is reviewable;
-  // one that doesn't (added then deleted in the chat) is dropped.
-  const displayedFiles = useMemo(() => {
-    const names = new Set<string>(basePaths ?? [])
-    if (branchMode) {
-      if (removedSignature !== '') {
-        for (const name of removedSignature.split('\u0000')) {
-          const atReview = reviewFiles.get(name)
-          const existsAtReview = atReview !== undefined ? !('absent' in atReview) : names.has(name)
-          if (existsAtReview) names.add(name)
-          else names.delete(name)
-        }
-      }
-      if (chatFiles !== undefined) {
-        for (const name of chatFiles.keys()) names.add(name)
-      }
-      if (previewedNamesSignature !== '') {
-        for (const name of previewedNamesSignature.split('\u0000')) names.add(name)
-      }
+  // ---- the tree and the changes list -------------------------------------------------------
+
+  // The displayed tree (see buildBrowserTree): the content base's tree less the chat's removals,
+  // plus the chat's and the previews' files (which may be mid-creation). Null while the base
+  // tree is loading. A removed file is not in the tree; it is reviewable from the Changes list
+  // below, which lists it as deleted while it exists at the review base.
+  //
+  // Keyed on the *set* of overlaid paths (as signatures), not on the content maps: the tree is
+  // proportional to the repository, and a keystroke must not rebuild it.
+  const presentSignature = branchMode
+    ? touchedPaths.filter(path => !removedPaths.has(path)).join('\u0000')
+    : ''
+  const browserTree = useMemo(() => {
+    if (baseTree === null) return null
+    const present = presentSignature === '' ? NO_PATHS : presentSignature.split('\u0000')
+    const removed = removedSignature === '' ? NO_REMOVED : new Set(removedSignature.split('\u0000'))
+    return buildBrowserTree(baseTree, present, removed)
+  }, [baseTree, presentSignature, removedSignature])
+
+  // Statuses against the review base. Only touched paths can differ from it: an untouched path
+  // displays the content base's text, and every path where the review base differs from the
+  // content base was touched by the rows that imported the difference. A touched path whose
+  // review-base read is still in flight has no status yet; a removed one is listed as pending
+  // meanwhile (see deriveChanges), so that if the read fails the deletion candidate is still
+  // there to select and its pane shows the error and retry. `changes` is in path order.
+  const isDiffMode = branchMode
+  let fileChangeStatuses: Map<string, FileChangeStatus> | undefined
+  let changes: readonly ChangedFile[] = NO_CHANGES
+  if (isDiffMode) {
+    const derived = deriveChanges(touchedPaths, overlayText, reviewFiles, reviewBase !== undefined)
+    fileChangeStatuses = derived.statuses
+    changes = derived.changes
+  }
+
+  // Every path the view can show, changed files first (so the auto-selection below lands on
+  // one) and then the tree's leaves in display order. Empty while the tree is loading.
+  const treePaths = useMemo(
+    () => (browserTree !== null ? browserTreePaths(browserTree.roots) : NO_PATHS), [browserTree])
+  const changedSignature = changes.map(change => change.path).join('\u0000')
+  const displayedFiles: readonly string[] = useMemo(() => {
+    if (browserTree === null) return NO_PATHS
+    const names = changedSignature === '' ? [] : changedSignature.split('\u0000')
+    const seen = new Set(names)
+    for (const path of treePaths) {
+      if (!seen.has(path)) names.push(path)
     }
-    return [...names].toSorted()
-  }, [basePaths, branchMode, chatFiles, removedSignature, reviewFiles, previewedNamesSignature])
+    return names
+  }, [browserTree, treePaths, changedSignature])
   const displayedFilesRef = useRef(displayedFiles)
-  const prevDisplayedFilesRef = useRef<string[]>([])
-  // Stabilize identity so downstream memos don't churn per contentVersion bump.
+  const prevDisplayedFilesRef = useRef<readonly string[]>(NO_PATHS)
+  // Stabilize identity so downstream effects don't churn per contentVersion bump.
   const stableDisplayedFiles = areArraysEqual(prevDisplayedFilesRef.current, displayedFiles)
     ? prevDisplayedFilesRef.current
     : displayedFiles
   prevDisplayedFilesRef.current = stableDisplayedFiles
   displayedFilesRef.current = stableDisplayedFiles
+  // A displayed path's entry kind; a path not in the tree (a deleted file, listed only under
+  // Changes) opens as a file.
+  const browserTreeRef = useRef(browserTree)
+  browserTreeRef.current = browserTree
+  const leafKindOf = (path: string) => browserTreeRef.current?.leaves.get(path) ?? 'file'
+  // Whether a path currently names a file: a leaf of the displayed tree. Not the same as being
+  // listed -- a deleted (or pending) path is listed under Changes but is free to be created or
+  // renamed onto again.
+  const fileExists = (path: string) => browserTreeRef.current?.leaves.has(path) ?? false
 
-  // Auto-select the first file when files appear and nothing is selected.
+  // Auto-select a file when files appear and nothing is selected: the first changed file when
+  // there is one, else the first leaf that can open (a symlink or submodule cannot).
   useEffect(() => {
-    if (activeFile === null && stableDisplayedFiles.length > 0) {
-      setActiveFile(stableDisplayedFiles[0])
-    }
+    if (activeFile !== null) return
+    const first = stableDisplayedFiles.find(path => isOpenableKind(leafKindOf(path)))
+    if (first !== undefined) setActiveFile(first)
   }, [activeFile, stableDisplayedFiles])
 
-  // Avoid reporting an empty state before the committed files have loaded. The content base's
-  // tree stands in for head's: they differ only for a chat pinned at an older head, and
-  // whether the gadget has code at all doesn't turn on that.
+  // Avoid reporting an empty state before the committed tree has loaded. The content base's
+  // tree stands in for the accepted commit's: they differ only for a chat pinned at an older
+  // commit, and whether the workpiece has code at all doesn't turn on that.
   const onHasCodeChangeRef = useRef(onHasCodeChange)
   onHasCodeChangeRef.current = onHasCodeChange
   useEffect(() => {
-    if (basePaths !== null) {
-      onHasCodeChangeRef.current?.(basePaths.length > 0)
+    if (baseTree !== null) {
+      onHasCodeChangeRef.current?.(baseTree.length > 0)
     }
-  }, [basePaths])
+  }, [baseTree])
 
   // Select the file currently being edited by the agent, unless the user has manually switched
   // files during this turn.
@@ -986,39 +1039,6 @@ export default function GadgetCodeInterface({
       setActiveFile(target)
     }
   }, [isAgentActive, selectedChatId, streamingActiveFile, stableDisplayedFiles])
-
-  // ---- statuses ----------------------------------------------------------------------------
-
-  // Statuses against the review base. Only touched paths can differ from it: an untouched path
-  // displays the content base's text, and every path where the review base differs from the
-  // content base was touched by the rows that imported the difference. A touched path whose
-  // review-base read is still in flight has no status yet (the list shows it without a dot
-  // until the read lands).
-  const isDiffMode = branchMode
-  const changedFiles = new Set<string>()
-  let fileChangeStatuses: Map<string, FileChangeStatus> | undefined
-  if (isDiffMode) {
-    fileChangeStatuses = new Map()
-    for (const name of stableDisplayedFiles) {
-      const displayed = overlayText(name)
-      let status: FileChangeStatus = 'unchanged'
-      if (displayed !== undefined) {
-        const original = reviewFiles.get(name)
-        if (original === undefined) {
-          if (reviewBase !== undefined) continue  // still loading
-          if (displayed !== null) status = 'added'  // a pending gadget: no review base at all
-        } else if ('absent' in original) {
-          if (displayed !== null) status = 'added'
-        } else if (displayed === null) {
-          status = 'deleted'
-        } else if ('unreadable' in original || original.text !== displayed) {
-          status = 'modified'
-        }
-      }
-      fileChangeStatuses.set(name, status)
-      if (status !== 'unchanged') changedFiles.add(name)
-    }
-  }
 
   // ---- editing -----------------------------------------------------------------------------
 
@@ -1140,6 +1160,7 @@ export default function GadgetCodeInterface({
   // ---- file management (create / delete / rename / download) --------------------------------
 
   const handleFileSelect = (filename: string) => {
+    if (!isOpenableKind(leafKindOf(filename))) return
     if (activeFile !== filename) {
       hasUserSwitchedFilesThisTurnRef.current = true
     }
@@ -1157,7 +1178,7 @@ export default function GadgetCodeInterface({
 
   const handleFileCreate = (filename: string) => {
     if (isEditingLocked) return
-    if (stableDisplayedFiles.includes(filename)) {
+    if (fileExists(filename)) {
       toasts.add({ title: `File already exists: ${filename}`, variant: 'error' })
       return
     }
@@ -1169,7 +1190,7 @@ export default function GadgetCodeInterface({
 
   const handleFileDelete = (filename: string) => {
     if (isEditingLocked) return
-    if (!stableDisplayedFiles.includes(filename) || overlayText(filename) === null) {
+    if (!fileExists(filename)) {
       toasts.add({ title: 'File not found', variant: 'error' })
       return
     }
@@ -1184,12 +1205,15 @@ export default function GadgetCodeInterface({
 
   const handleFileRename = async (oldName: string, newName: string) => {
     if (isEditingLocked) return
-    if (stableDisplayedFiles.includes(newName)) {
+    // Only a plain file can be renamed: the browser withholds the action from other kinds (see
+    // FileBrowser for why an executable is among them), and this is the backstop.
+    if (leafKindOf(oldName) !== 'file') return
+    if (fileExists(newName)) {
       toasts.add({ title: `File already exists: ${newName}`, variant: 'error' })
       return
     }
     const target = { client, gadgetId: workpieceId, contentBase }
-    const baseText = stableDisplayedFiles.includes(oldName)
+    const baseText = fileExists(oldName)
       ? await readDisplayedText(oldName).catch(() => null)
       : null
     // The read may have outlasted the selection: applyLocalFileChanges targets the *current*
@@ -1209,7 +1233,7 @@ export default function GadgetCodeInterface({
       toasts.add({ title: 'File not found', variant: 'error' })
       return
     }
-    if (chatFilesNow?.has(newName) || displayedFilesRef.current.includes(newName)) {
+    if (chatFilesNow?.has(newName) || fileExists(newName)) {
       toasts.add({ title: `File already exists: ${newName}`, variant: 'error' })
       return
     }
@@ -1232,9 +1256,9 @@ export default function GadgetCodeInterface({
 
   // ---- render ------------------------------------------------------------------------------
 
-  // Outside a chat, ready means the content base's file list has loaded; within one, the
-  // chat's content must be in too. File content loads per file, under the list.
-  const isReady = basePaths !== null && (!branchMode || clientReady)
+  // Outside a chat, ready means the content base's tree has loaded; within one, the chat's
+  // content must be in too. File content loads per file, under the tree.
+  const isReady = browserTree !== null && (!branchMode || clientReady)
   const loading = !isReady && !clientError && treeError === null
 
   // Repair the file selection when the active file stops existing anywhere it could live --
@@ -1249,14 +1273,14 @@ export default function GadgetCodeInterface({
     }
   }, [activeFile, isReady, stableDisplayedFiles])
 
-  if (treeError !== null && basePaths === null) {
+  if (treeError !== null && browserTree === null) {
     return (
       <div
         className="flex flex-col justify-center items-center gap-3 px-6 text-center"
         style={{ height }}
       >
         <p className="m-0 text-sm text-kumo-danger">
-          Failed to load this gadget&apos;s code.
+          Failed to load this {workpieceNoun}&apos;s code.
         </p>
         <WorkshopButton
           tone="secondary"
@@ -1363,16 +1387,18 @@ export default function GadgetCodeInterface({
               : 'max-md:invisible max-md:-translate-x-full'
           }`}
         >
-          <FileSidebar
-            ref={fileSidebarRef}
-            files={stableDisplayedFiles}
+          <FileBrowser
+            // Expansion state is per workpiece: a switch starts the new one at its defaults.
+            key={workpieceId}
+            ref={fileBrowserRef}
+            tree={browserTree ?? EMPTY_BROWSER_TREE}
+            changes={changes}
+            statuses={fileChangeStatuses}
             activeFile={activeFile}
             streamingActiveFile={streamingActiveFile}
-            dirtyFiles={new Set()}
-            changedFiles={changedFiles}
-            fileChangeStatuses={fileChangeStatuses}
             isDiffMode={isDiffMode}
             editLocked={isEditingLocked}
+            workpieceNoun={workpieceNoun}
             onFileSelect={(filename) => {
               handleFileSelect(filename)
               setFileDrawerOpen(false)
@@ -1406,6 +1432,16 @@ export default function GadgetCodeInterface({
                 <>{activeFileModeLabel} <span className="font-mono font-medium text-kumo-default">{activeFile}</span></>
               ) : 'Files'}
             </div>
+            {summary.type === 'worktree' && (
+              // The worktree's HEAD -- the agent's last explicit commit. Display only: what the
+              // view shows as changed is relative to the accepted commit, never to this.
+              <span
+                className="shrink-0 rounded bg-kumo-tint px-1.5 py-0.5 font-mono text-[11px] leading-4 text-kumo-subtle"
+                title={`HEAD ${summary.headCommit}`}
+              >
+                {summary.headCommit.slice(0, 7)}
+              </span>
+            )}
             {activeFile && (
               <WorkshopIconButton
                 aria-label={`Download ${activeFile}`}
@@ -1433,7 +1469,7 @@ export default function GadgetCodeInterface({
                   {branchMode && (
                     <div className="mt-4 flex justify-center">
                       <WorkshopButton
-                        onClick={() => fileSidebarRef.current?.openCreateModal()}
+                        onClick={() => fileBrowserRef.current?.openCreateModal()}
                         disabled={isEditingLocked}
                         tone="primary"
                         className="!h-8"

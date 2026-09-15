@@ -554,11 +554,19 @@ can't yet show.
    deliveries are still stripped, so nothing worktree-related is visible yet.
 5. **frontend: file browser + `WorkpieceCodeInterface` + picker/tabs + preview fetch**
    (§5). Gadgets move onto the tree browser here — a visible change to the gadget Code
-   tab; review screenshots. Still no worktree data arrives.
+   tab; review screenshots. Still no worktree data arrives. Also lands the
+   `WorkpieceSummary` union in `workshop-shared` (type and docs only — the backend keeps
+   publishing gadgets alone until commit 7), since the picker/tab/code-interface branches
+   on `type === "worktree"` cannot type-check without it. The tree derivation
+   (`workpieceTree.ts`: base tree ⊕ overlay, statuses) is pure and unit-tested; the
+   browser sorts each directory subdirectories-first then by name, renames edit the leaf
+   name within its directory, and the old "dim every unchanged file in diff mode" styling
+   is dropped in favour of the Changes section. `flattenTreePaths` (commit 4) is removed,
+   superseded by `browserTreePaths` over the displayed tree.
 6. **frontend: rename** `GadgetCodeInterface` → `WorkpieceCodeInterface` (if not folded into
    3; rename-only commit).
-7. **shared + backend: turn on.** `WorkpieceSummary` union, `subscribeToWorkpieces`
-   publishing worktrees, deletion of the strip helpers / `deadWorktreeIds` / call sites,
+7. **shared + backend: turn on.** `subscribeToWorkpieces` publishing worktrees (the
+   `WorkpieceSummary` union itself landed in 5), deletion of the strip helpers / `deadWorktreeIds` / call sites,
    deletion of `getCodeAtCommit`, `proposedChangeWorkpieceIds` exclusion removed, preview
    throw removed, doc updates. Tests: invert the first plan's leak test (a client
    subscription *does* receive worktree rows, pins, messages, gapless revisions); summary
