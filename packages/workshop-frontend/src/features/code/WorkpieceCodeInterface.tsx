@@ -73,7 +73,7 @@ import { isTransientRpcError } from '../../rpcErrors'
 // There is no standalone (out-of-chat) editing: accepted commits only advance when a chat's
 // changes are accepted.
 
-interface GadgetCodeInterfaceProps {
+interface WorkpieceCodeInterfaceProps {
   overseer: RpcStub<Overseer>
   // The selected workpiece, whose files the editor shows.
   summary: WorkpieceSummary
@@ -216,11 +216,11 @@ function replaceSpanTextChange(
   return change
 }
 
-export default function GadgetCodeInterface({
+export default function WorkpieceCodeInterface({
   overseer, summary, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
   isVisible = true, onHasCodeChange,
-}: GadgetCodeInterfaceProps) {
+}: WorkpieceCodeInterfaceProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
   toastsRef.current = toasts

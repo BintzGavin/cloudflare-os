@@ -34,7 +34,7 @@ import {
   WorkpiecesSubscriber,
 } from '@gadgets/workshop-shared/api'
 import ObserverConfigModal from './ObserverConfigModal'
-import GadgetCodeInterface from './features/code/GadgetCodeInterface'
+import WorkpieceCodeInterface from './features/code/WorkpieceCodeInterface'
 import GadgetUI from './GadgetUI'
 import GadgetUseView from './GadgetUseView'
 import Connections from './Connections'
@@ -710,7 +710,7 @@ export default function GadgetEditor() {
   ], [visibleGadgets, allWorktrees, effectiveSelectedChatId])
 
   // Gadgets still pending (created within) the selected chat: their chat content builds up from
-  // nothing rather than from a pinned commit (see GadgetCodeInterface's pendingGadgetIds).
+  // nothing rather than from a pinned commit (see WorkpieceCodeInterface's pendingGadgetIds).
   const pendingGadgetIds = useMemo(() => new Set(
     allGadgets.filter(w => w.chatId !== undefined && w.chatId === effectiveSelectedChatId)
       .map(w => w.id)
@@ -1921,7 +1921,7 @@ export default function GadgetEditor() {
 
             <div className={activeTab === 'code' ? 'h-full' : 'hidden'}>
               {overseer && selectedWorkpieceSummary ? (
-                <GadgetCodeInterface
+                <WorkpieceCodeInterface
                   overseer={overseer.stub}
                   summary={selectedWorkpieceSummary}
                   height="100%"

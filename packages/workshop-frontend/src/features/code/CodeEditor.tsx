@@ -20,7 +20,7 @@ import { useTheme } from '../../ThemeContext'
 // CodeDiffEditor, which reuses this module's session wiring.
 
 /**
- * An editable file's connection to the chat's OT client (see GadgetCodeInterface): the editor
+ * An editable file's connection to the chat's OT client (see WorkpieceCodeInterface): the editor
  * reads the initial text, pushes locally-authored changes, and receives remote deltas. `key`
  * identifies the document's identity -- when it changes, the editor rebuilds its state from
  * getText() (chat/file switches, client rebuilds); while it is stable, the text evolves only

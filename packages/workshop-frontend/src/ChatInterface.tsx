@@ -141,7 +141,7 @@ export interface ChatLiveChangeRows {
  * call will produce no row (it may name any call of the response, not just the streaming one);
  * `reset` is the mop-up that drops all preview state (turn ended, stream lost). The consumer
  * additionally resolves each preview when its durable change row arrives (see
- * GadgetCodeInterface), which is the ordinary end of a successful one.
+ * WorkpieceCodeInterface), which is the ordinary end of a successful one.
  */
 export type EditPreviewEvent = {
   kind: "start";
@@ -3521,7 +3521,7 @@ function ChatInterface({
 
       // The turn-flush "changes" message covers every row a successful edit appended, and an
       // error message ends the step -- either way this step's previews are over (ordinarily
-      // each previewed edit's own row already resolved it; see GadgetCodeInterface).
+      // each previewed edit's own row already resolved it; see WorkpieceCodeInterface).
       if (msg.type === "changes" || msg.type === "error") {
         resetEditPreviews(msg.chatId);
       }
