@@ -1322,46 +1322,60 @@ export async function runAgent(
   // Applies a replayed change to the session content, optionally rendering the change as unified
   // diffs for the model (used to surface user edits as observeUserChanges results). Changes make
   // the changed paths and contents directly visible, so the diff is computed from the change's own
-  // before/after values. Diffs are grouped by gadget: each gadget with changes contributes a
-  // heading line naming it (unified diff format tolerates metadata between files, and this
-  // output only needs to be understandable to the model, not valid `patch` input), followed by
-  // its files' diffs with bare filenames. A gadget with no in-scope binding gets no diff output:
-  // the agent can't reference it, so a diff would only confuse it.
+  // before/after values. Diffs are grouped by workpiece: each one with changes contributes a
+  // heading line naming it by its env name -- the name the model addresses it by (unified diff
+  // format tolerates metadata between files, and this output only needs to be understandable to
+  // the model, not valid `patch` input) -- followed by its files' diffs with bare filenames. A
+  // workpiece with no in-scope binding gets no diff output: the agent can't reference it, so a
+  // diff would only confuse it.
+  //
+  // A deletion is reported as its file header alone (`--- a/path` / `+++ /dev/null`, the same
+  // header a deleted empty file gets, plus a note that the contents were omitted), never by
+  // quoting the file: the model can't act on text that no longer exists, so those tokens would
+  // be wasted. That also means a deletion needs no base text -- only whether there was a file to
+  // delete, which for an entry rooted at a base commit (sparse: untouched paths are absent from
+  // the map) is "not already removed", and for a complete entry is "present in the map". (A
+  // `set` of a base path a sparse entry hasn't loaded renders as an addition, since the previous
+  // text isn't at hand; the shipped clients emit `set` only for new or re-created files, so this
+  // is cosmetic and left alone.)
   let applyReplayedChange = (change: CodeChange, includeDiff: boolean): string | undefined => {
     let before = sessionContent;
     sessionContent = applyCodeChange(sessionContent, change);
-    noteWorktreeRemovals(change);
-    if (!includeDiff) return;
 
     let diffParts: string[] = [];
-    for (let info of gadgetInfos) {
-      let entries = change[info.id];
-      if (entries === undefined) continue;
-      let envName = chatNameFor(info.id);
+    for (let [key, entries] of includeDiff ? Object.entries(change) : []) {
+      let id = Number(key);
+      let envName = chatNameFor(id);
       if (envName === undefined) continue;
 
-      let gadgetDiffParts: string[] = [];
-      for (let [filename] of [...entries].toSorted((a, b) => a[0] < b[0] ? -1 : 1)) {
-        let oldContent = before.get(info.id)?.get(filename);
-        let newContent = sessionContent.get(info.id)?.get(filename);
+      let fileDiffParts: string[] = [];
+      for (let [filename, fileChange] of [...entries].toSorted((a, b) => a[0] < b[0] ? -1 : 1)) {
+        let oldContent = before.get(id)?.get(filename);
+        if ("remove" in fileChange) {
+          let existed = oldContent !== undefined ||
+              (worktreeBase(id) !== undefined && !worktreeRemovedPaths.get(id)?.has(filename));
+          if (existed) {
+            fileDiffParts.push(
+                `${formatUnifiedDiff(filename, "", "", true, false)}\n` +
+                `(file deleted; former contents omitted)`);
+          }
+          continue;
+        }
+        let newContent = sessionContent.get(id)?.get(filename);
         if (oldContent === newContent) continue;
         let diff = formatUnifiedDiff(
-            filename,
-            oldContent ?? "",
-            newContent ?? "",
-            oldContent !== undefined,
-            newContent !== undefined);
+            filename, oldContent ?? "", newContent ?? "", oldContent !== undefined, true);
         if (diff) {
-          gadgetDiffParts.push(diff);
+          fileDiffParts.push(diff);
         }
       }
 
-      if (gadgetDiffParts.length > 0) {
-        diffParts.push(
-            `==== Gadget env.${envName}: ${JSON.stringify(info.title)} ====`,
-            ...gadgetDiffParts);
+      if (fileDiffParts.length > 0) {
+        diffParts.push(`==== env.${envName} ====`, ...fileDiffParts);
       }
     }
+    // After the loop: the "already removed" test above asks about the state before this change.
+    noteWorktreeRemovals(change);
 
     if (diffParts.length > 0) {
       return diffParts.join("\n");
@@ -2057,12 +2071,13 @@ export async function runAgent(
           // are still surfaced as observations below. A conversion boundary's change is not user
           // activity -- it re-records content from before the boundary, which the model already
           // saw (or wrote) -- so it applies without an observation.
-          if (msg.change !== undefined) await seedWorktreeBasesForChange(msg.change);
-          let diff = msg.change !== undefined
-              ? applyReplayedChange(
-                  msg.change, msg.author.type === "user" && !msg.conversionBoundary)
-              : undefined;
-          if (msg.author.type === "user" && !msg.conversionBoundary) {
+          let isUserActivity = msg.author.type === "user" && !msg.conversionBoundary;
+          let diff: string | undefined;
+          if (msg.change !== undefined) {
+            await seedWorktreeBasesForChange(msg.change);
+            diff = applyReplayedChange(msg.change, isUserActivity);
+          }
+          if (isUserActivity) {
             // Surface everything the user did in this batch as one synthetic observation:
             // gadgets they created and bindings they added from the workspace UI
             // (agent-initiated creations/additions need no note -- the model already sees its
