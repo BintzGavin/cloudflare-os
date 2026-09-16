@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
-import { DownloadSimple, List } from '@phosphor-icons/react'
+import { DownloadSimple, GitBranch, List } from '@phosphor-icons/react'
 import type {
   FileAtCommit, Overseer, WorkpieceId, WorkpieceSummary,
 } from '@gadgets/workshop-shared/api'
@@ -8,7 +8,7 @@ import {
   MAX_FILE_TEXT_LENGTH, type CodeChange, type FileChange, type TextChange,
 } from '@gadgets/workshop-shared/code-change'
 import { RpcStub } from 'capnweb'
-import FileBrowser, { isOpenableKind, type FileBrowserHandle } from './FileBrowser'
+import FileBrowser, { isOpenableKind, type ExpandedDirs, type FileBrowserHandle } from './FileBrowser'
 import { WorkshopButton, WorkshopIconButton } from '../../components/WorkshopControls'
 import CodeEditor, { type EditSession } from './CodeEditor'
 import CodeDiffEditor from './CodeDiffEditor'
@@ -838,6 +838,10 @@ export default function WorkpieceCodeInterface({
   const [fileDrawerOpen, setFileDrawerOpen] = useState(false)
   const [compactLayout, setCompactLayout] = useState(false)
   const fileBrowserRef = useRef<FileBrowserHandle | null>(null)
+  // Which directories the user opened or closed in each workpiece's tree, kept for as long as
+  // this view is mounted (the workspace's session): the browser remounts on a workpiece switch,
+  // and switching back should find the tree as it was left rather than at its defaults.
+  const expandedDirsByWorkpieceRef = useRef(new Map<WorkpieceId, ExpandedDirs>())
   const fileDrawerRef = useRef<HTMLDivElement | null>(null)
   const fileDrawerTriggerRef = useRef<HTMLButtonElement | null>(null)
 
@@ -902,15 +906,17 @@ export default function WorkpieceCodeInterface({
     wasAgentActiveRef.current = isAgentActive
   }, [isAgentActive, selectedChatId])
 
-  // When the selected workpiece changes, the previous gadget's file selection and per-turn
-  // state are meaningless; reset so the auto-select effect picks a file from the new gadget.
-  const prevWorkpieceRef = useRef(workpieceId)
-  useEffect(() => {
-    if (prevWorkpieceRef.current === workpieceId) return
-    prevWorkpieceRef.current = workpieceId
+  // When the selected workpiece changes, the previous workpiece's file selection and per-turn
+  // state are meaningless; reset so the auto-select effect picks a file from the new one. Done
+  // during render, not in an effect: the file browser remounts in this same render (keyed by
+  // workpiece) and reveals the active file's directories, so an effect would let it open -- and
+  // remember, as the new workpiece's expansion state -- the old workpiece's path.
+  const [activeFileWorkpiece, setActiveFileWorkpiece] = useState(workpieceId)
+  if (activeFileWorkpiece !== workpieceId) {
+    setActiveFileWorkpiece(workpieceId)
     setActiveFile(null)
     hasUserSwitchedFilesThisTurnRef.current = false
-  }, [workpieceId])
+  }
 
   // The paths whose text differs (or may differ) from the content base: the chat's touched
   // paths plus the previewed ones. Everything else displays the base's text and needs no
@@ -1388,7 +1394,8 @@ export default function WorkpieceCodeInterface({
           }`}
         >
           <FileBrowser
-            // Expansion state is per workpiece: a switch starts the new one at its defaults.
+            // Expansion state is per workpiece: a switch remounts the browser, which picks up
+            // where that workpiece's tree was left (or its defaults, the first time).
             key={workpieceId}
             ref={fileBrowserRef}
             tree={browserTree ?? EMPTY_BROWSER_TREE}
@@ -1399,6 +1406,8 @@ export default function WorkpieceCodeInterface({
             isDiffMode={isDiffMode}
             editLocked={isEditingLocked}
             workpieceNoun={workpieceNoun}
+            initialExpanded={expandedDirsByWorkpieceRef.current.get(workpieceId)}
+            onExpandedChange={expanded => expandedDirsByWorkpieceRef.current.set(workpieceId, expanded)}
             onFileSelect={(filename) => {
               handleFileSelect(filename)
               setFileDrawerOpen(false)
@@ -1436,9 +1445,13 @@ export default function WorkpieceCodeInterface({
               // The worktree's HEAD -- the agent's last explicit commit. Display only: what the
               // view shows as changed is relative to the accepted commit, never to this.
               <span
-                className="shrink-0 rounded bg-kumo-tint px-1.5 py-0.5 font-mono text-[11px] leading-4 text-kumo-subtle"
-                title={`HEAD ${summary.headCommit}`}
+                className="flex shrink-0 items-center gap-1 rounded bg-kumo-tint px-1.5 py-0.5 font-mono text-[11px] leading-4 text-kumo-subtle"
+                title={summary.headCommit === summary.baseCommit
+                  ? `HEAD ${summary.headCommit} (no commits since the worktree was created)`
+                  : `HEAD ${summary.headCommit}\nCreated at ${summary.baseCommit}`}
               >
+                <GitBranch size={11} aria-hidden="true" />
+                <span className="sr-only">HEAD </span>
                 {summary.headCommit.slice(0, 7)}
               </span>
             )}

@@ -45,6 +45,11 @@ interface FileBrowserProps {
   editLocked: boolean
   // What the workpiece is called in dialog copy: "gadget" or "worktree".
   workpieceNoun: string
+  // The directories the user has explicitly opened or closed, by path, as last reported through
+  // `onExpandedChange`. The browser owns this state from mount on; the pair lets the parent carry
+  // it across the remount that a workpiece switch and switch-back is (see WorkpieceCodeInterface).
+  initialExpanded?: ExpandedDirs
+  onExpandedChange?: (expanded: ExpandedDirs) => void
   onFileSelect: (path: string) => void
   // `path` is relative to the tree root; the dialog accepts `dir/name.ext`.
   onFileCreate: (path: string) => void
@@ -59,6 +64,12 @@ interface FileBrowserProps {
 export interface FileBrowserHandle {
   openCreateModal: () => void
 }
+
+/**
+ * Explicit per-directory expansion toggles: directory path -> open. A directory with no entry
+ * follows the tree's size-dependent default (see LARGE_TREE_LEAVES).
+ */
+export type ExpandedDirs = ReadonlyMap<string, boolean>
 
 /** Whether a leaf of this kind has text to show. */
 export function isOpenableKind(kind: LeafKind | undefined): boolean {
@@ -77,6 +88,8 @@ export default function FileBrowser({
   isDiffMode,
   editLocked,
   workpieceNoun,
+  initialExpanded,
+  onExpandedChange,
   onFileSelect,
   onFileCreate,
   onFileDelete,
@@ -105,7 +118,7 @@ export default function FileBrowser({
   // the selection moves, so a file the agent starts editing -- or one picked from the Changes
   // list -- is always in view; the user can still collapse them afterwards.
   const defaultExpanded = tree.leaves.size <= LARGE_TREE_LEAVES
-  const [expanded, setExpanded] = useState<ReadonlyMap<string, boolean>>(new Map())
+  const [expanded, setExpanded] = useState<ExpandedDirs>(() => initialExpanded ?? new Map())
   const [revealedFile, setRevealedFile] = useState<string | null>(null)
   if (activeFile !== revealedFile) {
     setRevealedFile(activeFile)
@@ -126,6 +139,13 @@ export default function FileBrowser({
       return next
     })
   }
+  // Reported from an effect rather than from the setters, because the reveal above updates the
+  // state during render, where a parent callback may not run.
+  const onExpandedChangeRef = useRef(onExpandedChange)
+  onExpandedChangeRef.current = onExpandedChange
+  useEffect(() => {
+    onExpandedChangeRef.current?.(expanded)
+  }, [expanded])
 
   const handleCreateFile = () => {
     const path = newFileName.trim()

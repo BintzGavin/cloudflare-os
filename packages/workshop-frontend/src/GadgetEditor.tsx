@@ -1425,8 +1425,12 @@ export default function GadgetEditor() {
     if (selectedWorkpieceId !== null) setWorkspaceVisibility('open', selectedWorkpieceId)
   }
 
+  // The mobile bar's workpiece tab: a gadget's preview, or -- since a worktree has nothing to
+  // preview -- its code. The "More" menu lights up for whatever else the pane is showing.
+  const mobilePrimaryTab: RightTab = selectedWorkpieceSummary?.type === 'worktree' ? 'code' : 'app'
   const mobilePreviewActive = showFullEditor && !paneShowsActivity && activeTab === 'app'
-  const mobileMoreActive = showFullEditor && !paneShowsActivity && activeTab !== 'app'
+  const mobilePrimaryActive = showFullEditor && !paneShowsActivity && activeTab === mobilePrimaryTab
+  const mobileMoreActive = showFullEditor && !paneShowsActivity && activeTab !== mobilePrimaryTab
 
   // ── always render the full two-pane edit layout; preview overlays on top ──────
   return (
@@ -1580,14 +1584,14 @@ export default function GadgetEditor() {
         </button>
         <button
           type="button"
-          onClick={() => openMobilePane('app')}
-          disabled={!selectedGadgetStub}
-          aria-current={mobilePreviewActive ? 'page' : undefined}
+          onClick={() => openMobilePane(mobilePrimaryTab)}
+          disabled={mobilePrimaryTab === 'app' ? !selectedGadgetStub : selectedWorkpieceSummary === undefined}
+          aria-current={mobilePrimaryActive ? 'page' : undefined}
           className={`flex h-9 min-w-0 flex-1 items-center justify-center rounded-lg px-3 text-[14px] font-medium disabled:opacity-40 ${
-            mobilePreviewActive ? 'bg-kumo-tint text-kumo-default' : 'text-kumo-subtle'
+            mobilePrimaryActive ? 'bg-kumo-tint text-kumo-default' : 'text-kumo-subtle'
           }`}
         >
-          Preview
+          {mobilePrimaryTab === 'app' ? 'Preview' : 'Code'}
         </button>
         <button
           type="button"
@@ -1618,28 +1622,36 @@ export default function GadgetEditor() {
             }
           />
           <DropdownMenu.Content className={MENU_CONTENT} style={MENU_POSITIONER_STYLE}>
-            <DropdownMenu.Item
-              disabled={selectedWorkpieceSummary === undefined}
-              onClick={() => openMobilePane('code')}
-              className={MENU_ITEM}
-            >
-              Code
-            </DropdownMenu.Item>
-            <DropdownMenu.Item
-              disabled={!selectedGadgetStub}
-              onClick={() => openMobilePane('connections')}
-              className={MENU_ITEM}
-            >
-              Connections
-            </DropdownMenu.Item>
+            {mobilePrimaryTab !== 'code' && (
+              <DropdownMenu.Item
+                disabled={selectedWorkpieceSummary === undefined}
+                onClick={() => openMobilePane('code')}
+                className={MENU_ITEM}
+              >
+                Code
+              </DropdownMenu.Item>
+            )}
+            {selectedWorkpieceSummary?.type !== 'worktree' && (
+              <DropdownMenu.Item
+                disabled={!selectedGadgetStub}
+                onClick={() => openMobilePane('connections')}
+                className={MENU_ITEM}
+              >
+                Connections
+              </DropdownMenu.Item>
+            )}
             {visibleWorkpieces.length > 1 && <DropdownMenu.Separator />}
             {visibleWorkpieces.length > 1 && visibleWorkpieces.map(workpiece => (
               <DropdownMenu.Item
                 key={workpiece.id}
                 onClick={() => handleSelectWorkpiece(workpiece.id)}
-                className={MENU_ITEM}
+                aria-current={workpiece.id === selectedWorkpieceId ? 'true' : undefined}
+                className={`${MENU_ITEM} ${workpiece.id === selectedWorkpieceId ? 'font-medium' : ''}`}
               >
-                {workpiece.title}
+                <span className="flex min-w-0 items-center gap-2">
+                  <WorkpieceGlyph summary={workpiece} className="flex-shrink-0 text-kumo-subtle" />
+                  <span className="truncate">{workpiece.title}</span>
+                </span>
               </DropdownMenu.Item>
             ))}
             <DropdownMenu.Separator />
@@ -1649,20 +1661,26 @@ export default function GadgetEditor() {
             <DropdownMenu.Item onClick={() => setShareModalOpen(true)} className={MENU_ITEM}>
               Share workspace
             </DropdownMenu.Item>
-            <DropdownMenu.Item
-              disabled={!selectedGadgetStub}
-              onClick={() => setBlueprintModalOpen(true)}
-              className={MENU_ITEM}
-            >
-              Blueprints
-            </DropdownMenu.Item>
-            <DropdownMenu.Item
-              disabled={!mobilePreviewActive}
-              onClick={enterGadgetFullscreen}
-              className={MENU_ITEM}
-            >
-              Full-screen preview
-            </DropdownMenu.Item>
+            {/* App-only actions are left out for a worktree rather than shown disabled, as the
+                desktop header leaves out its full-screen button. */}
+            {selectedWorkpieceSummary?.type !== 'worktree' && (
+              <>
+                <DropdownMenu.Item
+                  disabled={!selectedGadgetStub}
+                  onClick={() => setBlueprintModalOpen(true)}
+                  className={MENU_ITEM}
+                >
+                  Blueprints
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  disabled={!mobilePreviewActive}
+                  onClick={enterGadgetFullscreen}
+                  className={MENU_ITEM}
+                >
+                  Full-screen preview
+                </DropdownMenu.Item>
+              </>
+            )}
             {!metadata.owner && (
               <>
                 <DropdownMenu.Separator />
@@ -1843,7 +1861,9 @@ export default function GadgetEditor() {
               )}
 
               <WorkshopIconButton
-                aria-label={paneShowsActivity ? 'Close activity' : 'Close gadget pane'}
+                aria-label={paneShowsActivity
+                  ? 'Close activity'
+                  : selectedWorkpieceSummary?.type === 'worktree' ? 'Close worktree pane' : 'Close gadget pane'}
                 title="Close"
                 onClick={closeWorkspacePane}
               >
@@ -1922,6 +1942,9 @@ export default function GadgetEditor() {
             <div className={activeTab === 'code' ? 'h-full' : 'hidden'}>
               {overseer && selectedWorkpieceSummary ? (
                 <WorkpieceCodeInterface
+                  // Per workspace, like the ChatInterface: its per-chat clients and per-workpiece
+                  // memory are keyed by ids that another workspace reuses.
+                  key={id}
                   overseer={overseer.stub}
                   summary={selectedWorkpieceSummary}
                   height="100%"

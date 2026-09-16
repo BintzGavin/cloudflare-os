@@ -5,7 +5,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { TreeNode } from '@gadgets/workshop-shared/api'
-import FileBrowser from './FileBrowser'
+import FileBrowser, { type ExpandedDirs } from './FileBrowser'
 import { buildBrowserTree, type ChangedFile } from './workpieceTree'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -39,6 +39,8 @@ describe('FileBrowser', () => {
     isDiffMode?: boolean
     leafCount?: number
     onFileSelect?: (path: string) => void
+    initialExpanded?: ExpandedDirs
+    onExpandedChange?: (expanded: ExpandedDirs) => void
   } = {}) {
     // Pad the base with enough leaves to cross the large-tree threshold when asked.
     const padded: TreeNode[] = options.leafCount !== undefined
@@ -59,6 +61,8 @@ describe('FileBrowser', () => {
           isDiffMode={options.isDiffMode ?? true}
           editLocked={false}
           workpieceNoun="gadget"
+          initialExpanded={options.initialExpanded}
+          onExpandedChange={options.onExpandedChange}
           onFileSelect={onFileSelect}
           onFileCreate={vi.fn<(path: string) => void>()}
           onFileDelete={vi.fn<(path: string) => void>()}
@@ -112,6 +116,30 @@ describe('FileBrowser', () => {
     expect(rowLabels(container)).toEqual([
       'bin', 'pad', 'src', 'deep', 'inner.ts', 'a.ts', 'README.md',
     ])
+  })
+
+  it('reports expansion toggles and resumes from them on a fresh mount', async () => {
+    let remembered: ExpandedDirs | undefined
+    const { container } = await render({ onExpandedChange: expanded => { remembered = expanded } })
+    const srcToggle = [...container.querySelectorAll('button')].find(b => b.textContent === 'src')!
+    await act(async () => srcToggle.click())
+    expect(rowLabels(container)).toEqual(['bin', 'run', 'src', 'README.md'])
+    expect(remembered?.get('src')).toBe(false)
+    await act(async () => root?.unmount())
+    document.body.replaceChildren()
+
+    const resumed = await render({ initialExpanded: remembered })
+    expect(rowLabels(resumed.container)).toEqual(['bin', 'run', 'src', 'README.md'])
+  })
+
+  it('remembers directories the active-file reveal opened', async () => {
+    let remembered: ExpandedDirs | undefined
+    const { rerender } = await render({
+      leafCount: 250, onExpandedChange: expanded => { remembered = expanded },
+    })
+    await rerender('src/deep/inner.ts')
+    expect(remembered?.get('src')).toBe(true)
+    expect(remembered?.get('src/deep')).toBe(true)
   })
 
   it('lists changed files above the tree, with a deleted file the tree no longer holds', async () => {

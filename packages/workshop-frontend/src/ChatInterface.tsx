@@ -209,21 +209,40 @@ export interface ChatCodeChanges {
   rowsThrough: number;
 }
 
-type CreatedGadgetCardInfo = {
-  gadgetId: WorkpieceId;
+// A workpiece the transcript offers to open: one card per creation recorded on a "changes"
+// message (`createdGadgets` / `createdWorktrees`), so the two kinds can never be confused.
+type CreatedWorkpieceCardInfo = {
+  workpieceId: WorkpieceId;
   title: string;
+  // The creation hasn't been accepted yet: reverting the turn deletes the workpiece.
   isPending: boolean;
+} & (
+  | {
+      type: "gadget";
+      // The output format this gadget was built as, inherited from the blueprint it came from.
+      // Absent for a gadget built from scratch, which reads as a generic app.
+      output?: BlueprintOutput;
+    }
+  | { type: "worktree" }
+);
 
-  // The output format this gadget was built as, inherited from the blueprint it came from.
-  // Absent for a gadget built from scratch, which reads as a generic app.
-  output?: BlueprintOutput;
-};
+// The card's caption: what the workpiece is and what clicking does. A worktree has no app to
+// preview; opening it lands on its code.
+function describeCreatedWorkpiece(created: CreatedWorkpieceCardInfo): string {
+  if (created.type === "worktree") {
+    return created.isPending ? "New worktree · Click to review" : "Worktree · Click to open";
+  }
+  const noun = formatOf(created.output).noun;
+  return created.isPending
+    ? `New ${noun.toLowerCase()} · Click to preview`
+    : `${noun} · Click to open`;
+}
 
-function CreatedGadgetChatCard({
-  gadget,
+function CreatedWorkpieceChatCard({
+  created,
   onOpen,
 }: {
-  gadget: CreatedGadgetCardInfo;
+  created: CreatedWorkpieceCardInfo;
   onOpen: () => void;
 }) {
   return (
@@ -238,26 +257,26 @@ function CreatedGadgetChatCard({
           aria-hidden="true"
         >
           <span className="absolute inset-0 bg-gradient-to-br from-kumo-brand/[0.08] via-transparent to-transparent" />
-          {/* Drawn from the shared format vocabulary, so this card depicts a Document as a page
-              rather than a generic window the moment formats exist. */}
-          <FormatMiniature output={gadget.output} />
+          {created.type === "worktree" ? (
+            <GitBranch size={28} weight="regular" className="text-kumo-subtle" />
+          ) : (
+            /* Drawn from the shared format vocabulary, so this card depicts a Document as a page
+               rather than a generic window the moment formats exist. */
+            <FormatMiniature output={created.output} />
+          )}
         </span>
         <span className="flex min-w-0 flex-1 items-center gap-2 px-3.5 py-3 pr-10">
           <span className="min-w-0 flex-1">
             <span className="block truncate text-[14px] font-medium tracking-[-0.2px] text-kumo-default">
-              {gadget.title}
+              {created.title}
             </span>
             <span className="mt-0.5 flex items-center gap-1.5 text-[12px] text-kumo-subtle">
-              {gadget.isPending && (
+              {created.isPending && (
                 <span className="rounded-full bg-kumo-fill px-1.5 py-0.5 text-[10px] font-medium leading-none">
                   Draft
                 </span>
               )}
-              <span>
-                {gadget.isPending
-                    ? `New ${formatOf(gadget.output).noun.toLowerCase()} · Click to preview`
-                    : `${formatOf(gadget.output).noun} · Click to open`}
-              </span>
+              <span>{describeCreatedWorkpiece(created)}</span>
             </span>
           </span>
           <span className="grid h-7 w-7 flex-shrink-0 place-items-center rounded-full text-kumo-inactive transition-all duration-150 group-hover:bg-kumo-tint group-hover:text-kumo-default">
@@ -629,13 +648,23 @@ type PhosphorIcon = typeof MagnifyingGlass;
 
 type ActionChatMessage = Extract<AiChatMessage, { type: "action" }>;
 type ChangeChatMessage = Extract<AiChatMessage, { type: "changes" }>;
+// A workpiece created by a turn's pending changes (see `createdGadgets` / `createdWorktrees` on
+// the "changes" message body). Reverting the turn deletes it, so discard affordances name it.
+type CreatedWorkpieceName = { type: "gadget" | "worktree"; title: string };
+
 type PendingTurnChanges = {
   revertFrom: number;
   through: number;
-  // Titles of gadgets created by this turn's pending changes (see `createdGadgets` on the
-  // "changes" message body). Reverting the turn deletes them, so discard affordances name them.
-  createdGadgetTitles: string[];
+  createdWorkpieces: CreatedWorkpieceName[];
 };
+
+// The creations one "changes" message records, gadgets first, as discard labels list them.
+function createdWorkpiecesOf(m: ChangeChatMessage): CreatedWorkpieceName[] {
+  return [
+    ...(m.createdGadgets ?? []).map(({ title }) => ({ type: "gadget" as const, title })),
+    ...(m.createdWorktrees ?? []).map(({ title }) => ({ type: "worktree" as const, title })),
+  ];
+}
 type ObservationChatMessage = ActionChatMessage & {
   actionLog: NonNullable<ActionChatMessage["actionLog"]> & { type: "observation" };
 };
@@ -1596,7 +1625,7 @@ const ToolGroupRow = memo(function ToolGroupRow({
   footerChangeSequence,
   footerTimestamp,
   footerIsTrailing,
-  footerCreatedGadgetTitles,
+  footerCreatedWorkpieces,
   footerDisabled = false,
   onFooterRevert,
   outputOf,
@@ -1608,13 +1637,13 @@ const ToolGroupRow = memo(function ToolGroupRow({
   footerChangeSequence?: number;
   footerTimestamp?: Date;
   footerIsTrailing?: boolean;
-  footerCreatedGadgetTitles?: string[];
+  footerCreatedWorkpieces?: CreatedWorkpieceName[];
   footerDisabled?: boolean;
   onFooterRevert?: (sequence: number) => void;
   outputOf?: ToolOutputResolver;
 }) {
   const footerLabel = footerChangeSequence !== undefined
-    ? getDiscardLabel(footerIsTrailing, footerCreatedGadgetTitles)
+    ? getDiscardLabel(footerIsTrailing, footerCreatedWorkpieces)
     : null;
   return (
     <div className="group -ml-0.5">
@@ -1841,33 +1870,38 @@ function appendWorkParts(target: WorkMessageParts, source: WorkMessageParts) {
   }
 }
 
-// Suffix appended to discard labels when the discarded changes include gadget creations, since
-// reverting also deletes the created gadgets.
-function describeCreatedGadgetDeletion(titles: string[] | undefined): string {
-  if (!titles || titles.length === 0) return "";
-  const names = titles.map((t) => `“${t}”`).join(", ");
-  return ` (deletes ${titles.length === 1 ? "gadget" : "gadgets"} ${names})`;
+// Suffix appended to discard labels when the discarded changes include workpiece creations,
+// since reverting also deletes the created gadgets and worktrees: " (deletes gadget “A” and
+// worktrees “B”, “C”)".
+function describeCreatedWorkpieceDeletion(created: CreatedWorkpieceName[] | undefined): string {
+  if (!created || created.length === 0) return "";
+  const parts = (["gadget", "worktree"] as const).flatMap((type) => {
+    const titles = created.filter((c) => c.type === type).map((c) => `“${c.title}”`);
+    if (titles.length === 0) return [];
+    return [`${titles.length === 1 ? type : `${type}s`} ${titles.join(", ")}`];
+  });
+  return ` (deletes ${parts.join(" and ")})`;
 }
 
 // Label for the per-turn discard-changes button.
 function getDiscardLabel(
   isTrailing: boolean | undefined,
-  createdGadgetTitles?: string[],
+  createdWorkpieces?: CreatedWorkpieceName[],
 ): string {
   const base = isTrailing
     ? "Discard changes from this response"
     : "Discard changes from this response and later responses";
-  return base + describeCreatedGadgetDeletion(createdGadgetTitles);
+  return base + describeCreatedWorkpieceDeletion(createdWorkpieces);
 }
 
 function getSavedEditsDiscardLabel(
   isTrailing: boolean | undefined,
-  createdGadgetTitles?: string[],
+  createdWorkpieces?: CreatedWorkpieceName[],
 ): string {
   const base = isTrailing
     ? "Discard saved edits"
     : "Discard saved edits and later changes";
-  return base + describeCreatedGadgetDeletion(createdGadgetTitles);
+  return base + describeCreatedWorkpieceDeletion(createdWorkpieces);
 }
 
 function DiscardPendingChangesPopover({
@@ -1908,8 +1942,8 @@ function DiscardPendingChangesPopover({
             Discard all pending changes?
           </Popover.Title>
           <p className="mt-0.5 text-[11.5px] leading-4 tracking-[-0.15px] text-kumo-subtle">
-            Return to the last accepted version. Any gadgets created by these changes will be
-            permanently deleted. Pending changes can&apos;t be restored.
+            Return to the last accepted version. Any gadgets or worktrees created by these
+            changes will be permanently deleted. Pending changes can&apos;t be restored.
           </p>
           <p className="mt-2 border-t border-kumo-line pt-2 text-[11px] leading-[15px] tracking-[-0.1px] text-kumo-inactive">
             Use the <ArrowUUpLeft size={12} className="mx-0.5 inline-block align-[-2px]" aria-hidden="true" /><span className="sr-only">undo arrow</span> under any agent response to discard from that turn onward.
@@ -1941,9 +1975,11 @@ function DiscardPendingChangesPopover({
 // Collapse adjacent work rows; fold trailing work into the preceding assistant
 // message so one turn reads as one tool/resource run.
 function transcriptToolCalls(toolCalls: AiToolCall[]): AiToolCall[] {
-  // Successful creations render as cards; failed calls retain their error summary.
+  // Successful creations render as cards (see CreatedWorkpieceChatCard); failed calls retain
+  // their error summary.
   return toolCalls.filter((tc) =>
-    tc.toolName !== "createGadget" || tc.output === undefined || Boolean(tc.error));
+    (tc.toolName !== "createGadget" && tc.toolName !== "createWorktree") ||
+    tc.output === undefined || Boolean(tc.error));
 }
 
 export function buildChatDisplayEntries(
@@ -2419,7 +2455,8 @@ interface ChatInterfaceProps {
   // proposes nothing); see AiChatMetadata.proposedChangeWorkpieces.
   onSelectedChatProposedChangesChange?: (workpieceIds: readonly WorkpieceId[]) => void;
   constrainChatWidth?: boolean;
-  onOpenGadget: (gadgetId: WorkpieceId) => void;
+  // Opens a workpiece the transcript offers (a created gadget's app, a created worktree's code).
+  onOpenGadget: (workpieceId: WorkpieceId) => void;
 
   // The output format a workpiece was built as, so a created-app card can name and draw it as the
   // Document (or whatever) it is rather than a generic app.
@@ -4571,13 +4608,13 @@ function ChatInterface({
         m.sequence >= chatEpoch &&
         (messageStates.changeStatus.get(m.sequence) ?? "pending") === "pending"
       ) {
-        const createdTitles = (m.createdGadgets ?? []).map((g) => g.title);
+        const created = createdWorkpiecesOf(m);
         pendingTurnChanges = pendingTurnChanges === null
-          ? { revertFrom: m.sequence, through: m.sequence, createdGadgetTitles: createdTitles }
+          ? { revertFrom: m.sequence, through: m.sequence, createdWorkpieces: created }
           : {
               revertFrom: pendingTurnChanges.revertFrom,
               through: m.sequence,
-              createdGadgetTitles: [...pendingTurnChanges.createdGadgetTitles, ...createdTitles],
+              createdWorkpieces: [...pendingTurnChanges.createdWorkpieces, ...created],
             };
         attachPendingTurnChanges();
       }
@@ -4587,11 +4624,11 @@ function ChatInterface({
   }, [currentMessages, messageStates, chatEpoch]);
 
   // Accepted creations remain in the transcript; reverted ones disappear.
-  const createdGadgetsByTurnItemSeq = useMemo(() => {
-    const out = new Map<number, CreatedGadgetCardInfo[]>();
+  const createdWorkpiecesByTurnItemSeq = useMemo(() => {
+    const out = new Map<number, CreatedWorkpieceCardInfo[]>();
     let lastAgentMessageSeq: number | null = null;
     let lastVisibleWorkSeq: number | null = null;
-    let creations: CreatedGadgetCardInfo[] = [];
+    let creations: CreatedWorkpieceCardInfo[] = [];
     let creationAnchorSeq: number | null = null;
 
     const currentAnchorSeq = () => lastAgentMessageSeq ?? lastVisibleWorkSeq;
@@ -4644,14 +4681,22 @@ function ChatInterface({
       }
 
       const status = messageStates.changeStatus.get(m.sequence) ?? "pending";
-      if (status === "reverted" || !m.createdGadgets) continue;
+      if (status === "reverted" || !(m.createdGadgets || m.createdWorktrees)) continue;
+      const isPending = status === "pending";
       creations = [
         ...creations,
-        ...m.createdGadgets.map(({ gadgetId, title }) => ({
-          gadgetId,
+        ...(m.createdGadgets ?? []).map(({ gadgetId, title }): CreatedWorkpieceCardInfo => ({
+          type: "gadget",
+          workpieceId: gadgetId,
           title,
-          isPending: status === "pending",
+          isPending,
           output: outputOfWorkpiece(gadgetId),
+        })),
+        ...(m.createdWorktrees ?? []).map(({ worktreeId, title }): CreatedWorkpieceCardInfo => ({
+          type: "worktree",
+          workpieceId: worktreeId,
+          title,
+          isPending,
         })),
       ];
       attachCreations();
@@ -5559,7 +5604,7 @@ function ChatInterface({
                           ? "This update can't be discarded: it brought in changes already accepted elsewhere. Edit the files instead."
                           : getSavedEditsDiscardLabel(
                               entry.message.sequence === lastDurablePendingChange?.sequence,
-                              createdGadgets.map((g) => g.title),
+                              createdWorkpiecesOf(entry.message),
                             );
                         return (
                           <div key={entry.key} className={`${entryTopClass} group/savedChanges max-w-[860px] py-1 text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle`}>
@@ -5604,8 +5649,8 @@ function ChatInterface({
                       if (entry.type === "workRun") {
                         const pendingChange =
                           pendingChangeByTurnItemSeq.get(entry.lastMessageSequence) ?? null;
-                        const createdGadgets =
-                          createdGadgetsByTurnItemSeq.get(entry.lastMessageSequence) ?? [];
+                        const createdWorkpieces =
+                          createdWorkpiecesByTurnItemSeq.get(entry.lastMessageSequence) ?? [];
                         const showFooterOnGroupIndex = pendingChange
                           ? entry.toolCallGroups.length - 1
                           : -1;
@@ -5632,20 +5677,20 @@ function ChatInterface({
                                 footerIsTrailing={
                                   pendingChange?.through === lastDurablePendingChange?.sequence
                                 }
-                                footerCreatedGadgetTitles={
+                                footerCreatedWorkpieces={
                                   groupIndex === showFooterOnGroupIndex
-                                    ? pendingChange?.createdGadgetTitles
+                                    ? pendingChange?.createdWorkpieces
                                     : undefined
                                 }
                                 footerDisabled={isAgentActive}
                                 onFooterRevert={handleRevertChanges}
                               />
                             ))}
-                            {createdGadgets.map((created) => (
-                              <CreatedGadgetChatCard
-                                key={created.gadgetId}
-                                gadget={created}
-                                onOpen={() => onOpenGadget(created.gadgetId)}
+                            {createdWorkpieces.map((created) => (
+                              <CreatedWorkpieceChatCard
+                                key={created.workpieceId}
+                                created={created}
+                                onOpen={() => onOpenGadget(created.workpieceId)}
                               />
                             ))}
                           </div>
@@ -5742,8 +5787,8 @@ function ChatInterface({
                             const pendingChange = pendingChangeByTurnItemSeq.get(
                               actionMessageSeq,
                             ) ?? null;
-                            const createdGadgets =
-                              createdGadgetsByTurnItemSeq.get(actionMessageSeq) ?? [];
+                            const createdWorkpieces =
+                              createdWorkpiecesByTurnItemSeq.get(actionMessageSeq) ?? [];
                             const attachActionsToToolGroups =
                               !hasMessageText &&
                               !!pendingChange &&
@@ -5795,7 +5840,7 @@ function ChatInterface({
                                   {pendingChange && (() => {
                                     const label = getDiscardLabel(
                                       pendingChange.through === lastDurablePendingChange?.sequence,
-                                      pendingChange.createdGadgetTitles,
+                                      pendingChange.createdWorkpieces,
                                     );
                                     return (
                                     <Tooltip content={label} asChild>
@@ -5823,11 +5868,11 @@ function ChatInterface({
                               )}
                             </div>
 
-                            {createdGadgets.map((created) => (
-                              <CreatedGadgetChatCard
-                                key={created.gadgetId}
-                                gadget={created}
-                                onOpen={() => onOpenGadget(created.gadgetId)}
+                            {createdWorkpieces.map((created) => (
+                              <CreatedWorkpieceChatCard
+                                key={created.workpieceId}
+                                created={created}
+                                onOpen={() => onOpenGadget(created.workpieceId)}
                               />
                             ))}
 
@@ -5854,9 +5899,9 @@ function ChatInterface({
                                     footerIsTrailing={
                                       pendingChange?.through === lastDurablePendingChange?.sequence
                                     }
-                                    footerCreatedGadgetTitles={
+                                    footerCreatedWorkpieces={
                                       groupIndex === showFooterOnGroupIndex
-                                        ? pendingChange?.createdGadgetTitles
+                                        ? pendingChange?.createdWorkpieces
                                         : undefined
                                     }
                                     footerDisabled={isAgentActive}
