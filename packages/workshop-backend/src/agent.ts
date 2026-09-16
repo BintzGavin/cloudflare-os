@@ -2385,16 +2385,7 @@ export async function runAgent(
   };
   let codePreviewManager = new CodePreviewManager(
       emitStreamEvent,
-      workpiece => {
-        let resolved = hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
-        if (hooks.isWorktree(resolved.workpieceId)) {
-          // Worktree content never reaches clients (it is stripped from every delivery), so a
-          // streamed edit preview must not carry it either; an unresolvable target shows no
-          // preview (see CodePreviewManager).
-          throw new Error("worktree edits are not previewed");
-        }
-        return resolved;
-      });
+      workpiece => hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId));
   let executeCodeStreamManager = new ExecuteCodeStreamManager(emitStreamEvent);
 
   // Deployment-wide admin instructions, appended to the static system slot (slot 0) so they stay

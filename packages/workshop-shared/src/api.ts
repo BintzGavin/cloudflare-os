@@ -1749,8 +1749,10 @@ export interface Overseer extends RpcTarget {
    * Subscribe to the workspace's workpiece list.
    *
    * The subscriber receives one entry() per existing workpiece, followed by ready(), then
-   * incremental entry()/removed() calls as workpieces are created, renamed, or deleted. In v1
-   * only gadget-type workpieces are delivered (see WorkpieceSummary).
+   * incremental entry()/removed() calls as workpieces are created, renamed, or deleted, and
+   * whenever a summary field changes (a gadget's head, a worktree's accepted or head commit).
+   * Gadgets and worktrees are delivered (see WorkpieceSummary for which subscriptions see
+   * worktrees).
    *
    * Disposing the returned `RpcStub` will cancel the subscription.
    */
@@ -1784,36 +1786,29 @@ export interface Overseer extends RpcTarget {
   getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>>;
 
   /**
-   * Read the full contents of a commit in the workspace's git object store: one
-   * `[path, content]` entry per file, with nested trees flattened to `/`-joined paths. Paths are
-   * unique; entry order carries no meaning. (`files` is a list of pairs rather than a path-keyed
-   * object so that file names like `__proto__`, which RPC deserialization drops from object
-   * keys, survive in transit -- see CodeChange in `@gadgets/workshop-shared/code-change`.)
-   *
-   * Commits are immutable, so responses are cacheable client-side by commit ID. Use this to view
-   * committed code (outside any chat, or for a gadget the open chat has no pin for) and to fetch
-   * the base content of a chat's pins (see ChatCodeBase).
-   */
-  getCodeAtCommit(commitId: string): Promise<{files: [path: string, content: string][]}>;
-
-  /**
    * Read a commit's whole tree as nested TreeNodes: the root directory's entries, each
    * directory carrying its own, in git tree order (byte order of names, a directory sorting as
    * if its name had a trailing `/`). Only tree objects are read -- never blobs -- so the
    * response is proportional to the commit's entry count. Commits are immutable, so responses
    * are cacheable client-side by commit ID. Like readFilesAtCommit(), the read may pull missing
    * trees through the gatekeeper that provided the commit.
+   *
+   * Together with readFilesAtCommit() this is how clients read committed code: a workpiece's
+   * tree at its head or accepted commit (outside any chat, or when the open chat has no pin for
+   * it), and the base content of a chat's pins (see ChatCodeBase), one file at a time as it is
+   * opened or edited.
    */
   listTree(commitId: string): Promise<TreeNode[]>;
 
   /**
    * Read the content of the named files at a commit. Returns one `[path, FileAtCommit]` entry
-   * per requested path, in request order (a list of pairs, not a path-keyed object, for the
-   * same `__proto__` reason as getCodeAtCommit()). Blobs missing from the workspace's git store
-   * are pulled in one batch through the gatekeeper that provided the commit; a pull failure
-   * fails the whole call, since it is transient or actionable rather than a fact about any one
-   * file, whereas per-file conditions -- absent path, symlink, submodule, binary or oversized
-   * content -- are reported per entry (see FileAtCommit).
+   * per requested path, in request order (a list of pairs rather than a path-keyed object so
+   * that file names like `__proto__`, which RPC deserialization drops from object keys, survive
+   * in transit -- see CodeChange in `@gadgets/workshop-shared/code-change`). Blobs missing from
+   * the workspace's git store are pulled in one batch through the gatekeeper that provided the
+   * commit; a pull failure fails the whole call, since it is transient or actionable rather than
+   * a fact about any one file, whereas per-file conditions -- absent path, symlink, submodule,
+   * binary or oversized content -- are reported per entry (see FileAtCommit).
    *
    * At most MAX_READ_FILES_PER_CALL paths per call. The server stops decoding once the
    * accumulated text exceeds READ_FILES_RESPONSE_BUDGET and omits the remaining paths from the
@@ -1827,7 +1822,7 @@ export interface Overseer extends RpcTarget {
    * Walk the commit graph from `fromCommit` (that commit first, then its ancestry), returning up
    * to `depth` commits' metadata -- all reachable commits when `depth` is omitted. Traversal
    * order for merge commits follows git log's default (reverse chronological). Like
-   * getCodeAtCommit(), results are immutable and cacheable.
+   * listTree(), results are immutable and cacheable.
    */
   getCommitLog(fromCommit: string, depth?: number): Promise<CommitInfo[]>;
 
@@ -2383,16 +2378,14 @@ export type AiChatMetadata = {
 
   /**
    * The workpieces to which this chat has proposed changes that have not been accepted yet
-   * (including changes not yet materialized into a durable `changes` message): gadgets whose
-   * code the chat modified, gadgets it provisionally created, and gadgets it added a binding to.
-   * Absent (or empty) when the chat proposes nothing -- the pending-changes accept/discard
-   * affordances and per-gadget draft previews key off this list. Derived server-side and
-   * delivered on metadata updates; never submitted by clients.
-   *
-   * Worktrees never appear here for now: the UI has no worktree surface yet, so worktree-only
-   * changes must not prompt the user to accept or discard changes they cannot see. (This
-   * replaces the earlier `hasProposedChanges` boolean; values of that retired field may linger
-   * in stored metadata but are never delivered as truth.)
+   * (including changes not yet materialized into a durable `changes` message): gadgets and
+   * worktrees whose code the chat modified (pinned in the current epoch -- for a worktree, an
+   * explicit commit() counts as a modification) or that it provisionally created, and gadgets
+   * it added a binding to. Absent (or empty) when the chat proposes nothing -- the
+   * pending-changes accept/discard affordances and per-workpiece draft previews key off this
+   * list. Derived server-side and delivered on metadata updates; never submitted by clients.
+   * (This replaces the earlier `hasProposedChanges` boolean; values of that retired field may
+   * linger in stored metadata but are never delivered as truth.)
    */
   proposedChangeWorkpieces?: WorkpieceId[];
 
@@ -2435,22 +2428,28 @@ export type AiChatMetadata = {
  * changes fast-forwards each touched gadget's head (see Overseer.mergeChanges()). A gadget
  * joins the stream only when its code is first *modified* in the chat -- at that moment it is
  * pinned at a commit, whose tree its changes apply on top of. Unpinned gadgets always track
- * mainline head, live, and are read via Overseer.getCodeAtCommit(). One exception: a gadget
- * created within this chat and still pending has no head commit to pin, so it stays unpinned
- * while its changes build its content up from nothing (every file starts with a `set`); the merge
- * that makes it permanent ends the epoch anyway, and in later epochs it pins like any other
- * gadget. A worktree (see createdWorktrees) follows the same rule with its accepted commit in
- * the role of the head: unpinned it reads as that commit's tree, its first modification pins it
- * there, and an accept advances the accepted commit rather than creating a mainline commit.
+ * mainline head, live, and are read via Overseer.listTree()/readFilesAtCommit(). One exception:
+ * a gadget created within this chat and still pending has no head commit to pin, so it stays
+ * unpinned while its changes build its content up from nothing (every file starts with a
+ * `set`); the merge that makes it permanent ends the epoch anyway, and in later epochs it pins
+ * like any other gadget. A worktree (see createdWorktrees) follows the same rule with its
+ * accepted commit in the role of the head: unpinned it reads as that commit's tree, its first
+ * modification pins it there, and an accept advances the accepted commit rather than creating a
+ * mainline commit.
  *
- * Clients derive the chat's content themselves: for each pin, fetch the base tree
- * (Overseer.getCodeAtCommit(baseCommit)); apply the current epoch's non-reverted `changes`
- * messages' changes in log order; then apply the changes not yet materialized into a message,
- * delivered in revision order via AiChatSubscriber.changeApplied(). Accepting changes ends the
- * epoch: the pin set resets to empty and the change stream restarts.
+ * Clients derive the chat's content themselves: for each pin, start from `baseCommit`'s tree
+ * (Overseer.listTree(baseCommit), with each file's text read by path via readFilesAtCommit()
+ * only when something needs it -- an `edit` to apply, or a file the user opens; a whole
+ * repository tree is never fetched); apply the current epoch's non-reverted `changes` messages'
+ * changes in log order; then apply the changes not yet materialized into a message, delivered
+ * in revision order via AiChatSubscriber.changeApplied(). Accepting changes ends the epoch: the
+ * pin set resets to empty and the change stream restarts.
  */
 export type ChatCodeBase = {
-  /** Per-gadget pins: every permanent gadget whose code has been modified in the current epoch. */
+  /**
+   * Per-workpiece pins: every permanent gadget, and every worktree, whose code has been modified
+   * in the current epoch.
+   */
   pins: ChatGadgetPinState[];
 
   /**
@@ -2858,13 +2857,10 @@ export type AiChatMessageBody = {
    * modified (see ChatGadgetPin). Batches written before that was so carry the worktree's
    * birth pin `{gadgetId: worktreeId, baseCommit}` alongside the creation, which readers honor
    * as an ordinary pin. `bindingName` is the name in the creating chat's env, recorded so replay
-   * can pick it back up.
-   *
-   * Worktree *content* is stripped from every client delivery: clients receive `change` payloads
-   * without worktree entries and `pins` without worktree pins (revision numbering preserved), so
-   * ids in this field are the only worktree trace a client sees. There is no worktree UI yet;
-   * without the stripping, a delivered worktree pin would make the code-sync client fetch an
-   * entire repository tree as a base commit.
+   * can pick it back up. The worktree itself reaches the client as a WorktreeSummary on the
+   * workpiece subscription (a creation is a pending change; see
+   * AiChatMetadata.proposedChangeWorkpieces), and its content rides `change` and `pins` like a
+   * gadget's.
    */
   createdWorktrees?: {worktreeId: WorkpieceId, title: string, bindingName: string}[];
 
@@ -2933,9 +2929,9 @@ export type AiChatMessageBody = {
    * the worktree's accepted commit (to the same auto-commit) with no pin in the new generation,
    * so a merge written now carries no entry here. Auto-commits are internal bookkeeping,
    * squashed out of explicit history -- the worktree's reported head is untouched, and a later
-   * explicit commit parents on that head, never on an auto-commit. Worktree *content* is
-   * stripped from client deliveries, but this field is not a content-fetch trigger (unlike a
-   * `pins` entry) and rides along untouched.
+   * explicit commit parents on that head, never on an auto-commit. Clients do not need to read
+   * this field: a re-pin that is still in effect is mirrored in ChatCodeBase.pins, which is the
+   * only pin source a client uses.
    */
   worktreePins?: {worktreeId: WorkpieceId, baseCommit: string}[];
 } | {
@@ -3570,8 +3566,9 @@ export type AiChatStreamEvent = {
    * content/replacement field begins, since it is the input's final field).
    *
    * The event carries no base content: the client locates the span in its own copy of the file
-   * -- the chat's content, or the committed head for a gadget the chat doesn't cover -- which
-   * mirrors the content the agent computes its edit against (both are the same change stream).
+   * -- the chat's content, or the committed head (a worktree's accepted commit) for a workpiece
+   * the chat doesn't cover, read via readFilesAtCommit() if not yet loaded -- which mirrors the
+   * content the agent computes its edit against (both are the same change stream).
    * The preview is display-only provisional state, never entering the client's own change
    * tracking.
    *
@@ -3743,11 +3740,11 @@ export type GadgetSummary = {
 
   /**
    * The gadget's head commit (40-hex hash) in the workspace's git object store -- i.e. its
-   * committed mainline code, readable via Overseer.getCodeAtCommit()/getCommitLog(). Advances
-   * when a chat's changes are accepted; subscribeToWorkpieces() delivers a fresh entry()
-   * whenever it does. Absent only while the gadget is still pending in a chat (see `chatId`):
-   * every permanent gadget has a head, even before it has any code (an empty initial commit),
-   * so a chat's first edit always has a commit to pin (see ChatGadgetPin).
+   * committed mainline code, readable via Overseer.listTree() / readFilesAtCommit() /
+   * getCommitLog(). Advances when a chat's changes are accepted; subscribeToWorkpieces()
+   * delivers a fresh entry() whenever it does. Absent only while the gadget is still pending in
+   * a chat (see `chatId`): every permanent gadget has a head, even before it has any code (an
+   * empty initial commit), so a chat's first edit always has a commit to pin (see ChatGadgetPin).
    */
   commitId?: string;
 

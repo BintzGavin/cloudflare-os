@@ -81,9 +81,9 @@ describe("GitStore", () => {
     expect(await store.readCommitFiles(SECOND_COMMIT_OID)).toEqual(SECOND_FILES);
   });
 
-  it("survives Cap'n Web in Overseer.getCodeAtCommit's entry-list shape", async () => {
-    // A tree may legitimately name a file after an Object.prototype member, so getCodeAtCommit
-    // ships [path, content] pairs rather than a path-keyed object: Cap'n Web can't serialize a
+  it("survives Cap'n Web in Overseer.readFilesAtCommit's entry-list shape", async () => {
+    // A tree may legitimately name a file after an Object.prototype member, so the commit reads
+    // ship [path, content] pairs rather than a path-keyed object: Cap'n Web can't serialize a
     // null-prototype object at all, and deletes prototype-shadowing keys (and "toJSON") from
     // every ordinary object it deserializes -- either way such files would vanish on the wire.
     let store = new GitStore(makeObjects());
