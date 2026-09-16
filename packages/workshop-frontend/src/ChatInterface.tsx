@@ -214,24 +214,24 @@ export interface ChatCodeChanges {
 type CreatedWorkpieceCardInfo = {
   workpieceId: WorkpieceId;
   title: string;
-  // The creation hasn't been accepted yet: reverting the turn deletes the workpiece.
-  isPending: boolean;
 } & (
   | {
       type: "gadget";
+      // The creation hasn't been accepted yet: the gadget is a draft of this chat until then.
+      isPending: boolean;
       // The output format this gadget was built as, inherited from the blueprint it came from.
       // Absent for a gadget built from scratch, which reads as a generic app.
       output?: BlueprintOutput;
     }
+  // A worktree is private to its chat for life, so its creation is not a draft awaiting
+  // acceptance (see AiChatMetadata.proposedChangeWorkpieces) and the card doesn't say so.
   | { type: "worktree" }
 );
 
 // The card's caption: what the workpiece is and what clicking does. A worktree has no app to
 // preview; opening it lands on its code.
 function describeCreatedWorkpiece(created: CreatedWorkpieceCardInfo): string {
-  if (created.type === "worktree") {
-    return created.isPending ? "New worktree · Click to review" : "Worktree · Click to open";
-  }
+  if (created.type === "worktree") return "Worktree · Click to open its code";
   const noun = formatOf(created.output).noun;
   return created.isPending
     ? `New ${noun.toLowerCase()} · Click to preview`
@@ -271,7 +271,7 @@ function CreatedWorkpieceChatCard({
               {created.title}
             </span>
             <span className="mt-0.5 flex items-center gap-1.5 text-[12px] text-kumo-subtle">
-              {created.isPending && (
+              {created.type === "gadget" && created.isPending && (
                 <span className="rounded-full bg-kumo-fill px-1.5 py-0.5 text-[10px] font-medium leading-none">
                   Draft
                 </span>
@@ -2464,8 +2464,8 @@ interface ChatInterfaceProps {
 }
 
 // Whether a chat proposes changes the client can act on: the server delivers the touched
-// workpieces (worktree-only changes deliver none, deliberately -- see
-// AiChatMetadata.proposedChangeWorkpieces), so the pending-changes affordances key off this.
+// workpieces (see AiChatMetadata.proposedChangeWorkpieces -- a worktree the chat only created
+// and read is not among them), so the pending-changes affordances key off this.
 function chatHasProposedChanges(meta: AiChatMetadata): boolean {
   return (meta.proposedChangeWorkpieces?.length ?? 0) > 0;
 }
@@ -4682,21 +4682,19 @@ function ChatInterface({
 
       const status = messageStates.changeStatus.get(m.sequence) ?? "pending";
       if (status === "reverted" || !(m.createdGadgets || m.createdWorktrees)) continue;
-      const isPending = status === "pending";
       creations = [
         ...creations,
         ...(m.createdGadgets ?? []).map(({ gadgetId, title }): CreatedWorkpieceCardInfo => ({
           type: "gadget",
           workpieceId: gadgetId,
           title,
-          isPending,
+          isPending: status === "pending",
           output: outputOfWorkpiece(gadgetId),
         })),
         ...(m.createdWorktrees ?? []).map(({ worktreeId, title }): CreatedWorkpieceCardInfo => ({
           type: "worktree",
           workpieceId: worktreeId,
           title,
-          isPending,
         })),
       ];
       attachCreations();

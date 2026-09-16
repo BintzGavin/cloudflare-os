@@ -173,10 +173,15 @@ Backend:
   touched, but it is the stored-flag pattern `proposedChangeWorkpieceIds` was built to
   eliminate, and it adds state to shared metadata. Rejected unless review finds the
   re-pinning refactor too costly.)
-- **The "Pending changes" banner covers worktrees.** With pins-on-modification it does so
-  through the existing derivation: pinned worktrees, plus worktree records pending in the
-  chat (a creation is a pending change; reverting it deletes the worktree; accept
-  promotes it). Accept/Discard/per-turn revert are the same buttons and RPCs.
+- **The "Pending changes" banner covers worktrees — once modified.** With
+  pins-on-modification it does so through the existing derivation: pinned worktrees. A
+  worktree record merely *pending* in the chat (created, never written to or committed) does
+  **not** propose anything, unlike a pending gadget: a worktree stays private to its chat
+  whether or not it is accepted, so an agent that checks a repository out only to read it
+  would otherwise raise a banner over a chat with nothing to accept. The creation is still
+  revertable through its `changes` message (reverting deletes the worktree), and the next
+  accept that covers it sweeps its `pending`. Accept/Discard/per-turn revert are the same
+  buttons and RPCs.
 - **The whole tree is delivered up front, as a tree; only file content is lazy.**
   `listTree(commitId)` returns the commit's tree as **nested nodes** — each directory's
   entries in git order, names not paths — so the tree browser needs one call per base

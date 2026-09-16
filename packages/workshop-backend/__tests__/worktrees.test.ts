@@ -620,24 +620,26 @@ describe("client delivery of worktree content", () => {
         .toEqual({ [id]: [["secret.txt", { set: "worktree content\n" }]] });
   }));
 
-  it("a worktree is a proposed change once created, edited, or committed; not after accept",
+  it("a worktree is a proposed change once edited or committed, not merely created; not after accept",
       () => withImpl(async impl => {
     addChat(impl, 1);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let proposed = () =>
         impl.chatMetaForClient(impl.storage.chatMeta.get(1)!).proposedChangeWorkpieces;
 
-    // Creation alone: the pending record is the proposal (reverting it deletes the worktree).
+    // Creation alone proposes nothing: a checkout made only to be read must not raise the
+    // pending-changes banner. The creation stays pending (and revertable) meanwhile.
     let { id, baseCommit } = await createThroughBarrier(impl, 1, c1);
-    expect(proposed()).toEqual([id]);
-    await impl.mergeChanges(1, USER_META, "client-user");
     expect(proposed()).toBeUndefined();
+    expect(impl.storage.gadgets.get(id)!.pending?.chatId).toBe(1);
 
-    // An edit pins, which proposes; the accept's epoch reset unpins.
+    // An edit pins, which proposes; the accept's epoch reset unpins and, covering the creation,
+    // promotes it.
     await barrier(impl, 1, { changes: [{ change: { [id]: [["a.txt", { set: "edited\n" }]] } }]});
     expect(proposed()).toEqual([id]);
     await impl.mergeChanges(1, USER_META, "client-user");
     expect(proposed()).toBeUndefined();
+    expect(impl.storage.gadgets.get(id)!.pending).toBeUndefined();
 
     // A commit() alone pins too: the head advancement is a revertable proposed change.
     let pinBase = impl.storage.gadgets.get(id)!.pinBase;

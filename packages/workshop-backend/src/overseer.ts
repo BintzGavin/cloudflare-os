@@ -3187,7 +3187,7 @@ class OverseerImpl implements AgentHooks {
 
   // The workpieces this chat currently proposes changes to: pinned in the chat's current epoch
   // (a gadget or worktree joins the pin stream when its code is first modified -- see
-  // ChatCodeBase), created provisionally by the chat, or -- gadgets only -- targeted by a
+  // ChatCodeBase), or -- gadgets only -- created provisionally by the chat or targeted by a
   // provisional binding edge the chat added (which changes the gadget's env even though its code
   // is untouched). Purely derived: pins and pending records are maintained transactionally with
   // the changes themselves (established with their rows, rolled back by revert/discard,
@@ -3196,16 +3196,21 @@ class OverseerImpl implements AgentHooks {
   // to fight exactly that. (A chat from before worktree pins meant modification can hold a
   // worktree pin that proves nothing, which reads as proposed here until its first accept drops
   // it -- see mergeChanges. Accepted: few such chats exist, and one click clears it.)
+  //
+  // A worktree's *creation* alone proposes nothing, unlike a gadget's: accepting adds a pending
+  // gadget to the workspace, whereas a worktree stays private to its chat either way, so an
+  // agent that checks a repository out only to read it would otherwise raise the pending-changes
+  // banner over a chat with nothing to accept. The pending record still makes the creation
+  // revertable (deleting the worktree) and is swept by the next accept that covers it.
   proposedChangeWorkpieceIds(chatId: number, meta: AiChatMetadata): WorkpieceId[] {
     let ids = new Set<WorkpieceId>();
     for (let pin of meta.codeBase?.pins ?? []) {
       ids.add(pin.gadgetId);
     }
     for (let record of this.storage.gadgets.list()) {
-      if (ids.has(record.id)) continue;
+      if (ids.has(record.id) || record.type !== "gadget") continue;
       if (record.pending?.chatId === chatId ||
-          (record.type === "gadget" &&
-           Object.values(record.bindings).some(edge => edge.pending?.chatId === chatId))) {
+          Object.values(record.bindings).some(edge => edge.pending?.chatId === chatId)) {
         ids.add(record.id);
       }
     }

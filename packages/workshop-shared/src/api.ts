@@ -2380,10 +2380,13 @@ export type AiChatMetadata = {
    * The workpieces to which this chat has proposed changes that have not been accepted yet
    * (including changes not yet materialized into a durable `changes` message): gadgets and
    * worktrees whose code the chat modified (pinned in the current epoch -- for a worktree, an
-   * explicit commit() counts as a modification) or that it provisionally created, and gadgets
-   * it added a binding to. Absent (or empty) when the chat proposes nothing -- the
-   * pending-changes accept/discard affordances and per-workpiece draft previews key off this
-   * list. Derived server-side and delivered on metadata updates; never submitted by clients.
+   * explicit commit() counts as a modification), gadgets it provisionally created, and gadgets
+   * it added a binding to. A worktree's creation alone is not listed: it stays private to the
+   * chat whether or not it is accepted, so a checkout made only to be read proposes nothing
+   * (the creation is still revertable, see AiChatMessageBody.createdWorktrees). Absent (or
+   * empty) when the chat proposes nothing -- the pending-changes accept/discard affordances and
+   * per-workpiece draft previews key off this list. Derived server-side and delivered on
+   * metadata updates; never submitted by clients.
    * (This replaces the earlier `hasProposedChanges` boolean; values of that retired field may
    * linger in stored metadata but are never delivered as truth.)
    */
@@ -2858,9 +2861,10 @@ export type AiChatMessageBody = {
    * birth pin `{gadgetId: worktreeId, baseCommit}` alongside the creation, which readers honor
    * as an ordinary pin. `bindingName` is the name in the creating chat's env, recorded so replay
    * can pick it back up. The worktree itself reaches the client as a WorktreeSummary on the
-   * workpiece subscription (a creation is a pending change; see
-   * AiChatMetadata.proposedChangeWorkpieces), and its content rides `change` and `pins` like a
-   * gadget's.
+   * workpiece subscription, and its content rides `change` and `pins` like a gadget's. Unlike a
+   * gadget creation, a worktree creation by itself is not a proposed change (see
+   * AiChatMetadata.proposedChangeWorkpieces): nothing needs accepting until the worktree is
+   * first modified, though reverting this message still deletes it.
    */
   createdWorktrees?: {worktreeId: WorkpieceId, title: string, bindingName: string}[];
 
