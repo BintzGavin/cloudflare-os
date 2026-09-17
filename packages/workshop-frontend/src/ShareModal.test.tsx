@@ -225,6 +225,28 @@ async function invite(rendered: HTMLElement, username: string) {
   await click(button(rendered, 'Invite'))
 }
 
+function peopleInput(rendered: HTMLElement): HTMLInputElement {
+  return rendered.querySelector<HTMLInputElement>('input[aria-label="Search people"]')!
+}
+
+function pressKey(input: HTMLInputElement, key: string) {
+  return act(async () => input.dispatchEvent(
+    new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }),
+  ))
+}
+
+// The names staged in the composer, read from the chips' remove buttons. The people list's own
+// remove buttons live inside a <section>, so they are left out.
+function stagedNames(rendered: HTMLElement): string[] {
+  return [...rendered.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove "]')]
+    .filter(remove => remove.closest('section') === null)
+    .map(remove => remove.getAttribute('aria-label')!.slice('Remove '.length))
+}
+
+function profileFor(userId: string, role: CollaboratorRole, name: string): CollaboratorInfo {
+  return { profile: { type: 'user', id: userId, name }, role, addedBy: [] }
+}
+
 describe('ShareModal', () => {
   let root: Root | undefined
   let container: HTMLDivElement | undefined
@@ -340,11 +362,13 @@ describe('ShareModal', () => {
       option.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
       option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
-    expect(rendered.querySelector<HTMLInputElement>('input[aria-label="Search people"]')?.value)
-      .toBe('Ada Lovelace')
+    // Picking a result stages it as a chip and clears the field for the next name.
+    expect(stagedNames(rendered)).toEqual(['Ada Lovelace'])
+    expect(peopleInput(rendered).value).toBe('')
     await click(button(rendered, 'Invite'))
 
     expect(addCollaborator).toHaveBeenCalledWith('ada@cloudflare.com', 'use', undefined)
+    expect(stagedNames(rendered)).toEqual([])
   })
 
   it('submits the highlighted result from the primary Invite action', async () => {
@@ -435,12 +459,27 @@ describe('ShareModal', () => {
 
     await typeDirectorySearch(rendered, 'dormant@example.com')
     expect(rendered.textContent).toContain('No users found.')
-    const input = rendered.querySelector<HTMLInputElement>('input[aria-label="Search people"]')!
-    await act(async () => input.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-    ))
+    const input = peopleInput(rendered)
+    await pressKey(input, 'Enter')
+    expect(addCollaborator).not.toHaveBeenCalled()
 
+    // Enter on the now-empty field sends everyone staged.
+    await pressKey(input, 'Enter')
     expect(addCollaborator).toHaveBeenCalledWith('dormant@example.com', 'use', undefined)
+  })
+
+  it('stages a typed id as a chip and clears the field', async () => {
+    const rendered = await render(
+      fakeOverseer(),
+      fakeAuthenticatedApi({ searchUsers: async () => [] }),
+    )
+
+    await typeDirectorySearch(rendered, 'dormant@example.com')
+    await pressKey(peopleInput(rendered), 'Enter')
+
+    expect(stagedNames(rendered)).toEqual(['dormant@example.com'])
+    expect(peopleInput(rendered).value).toBe('')
+    expect(rendered.querySelector('[role="listbox"]')).toBeNull()
   })
 
   it('never queries the directory and invites by exact id when user search is off', async () => {
@@ -502,11 +541,12 @@ describe('ShareModal', () => {
       pending.resolve([{ id: 'alex.smith@example.com', name: 'Alex Smith' }])
       await Promise.resolve()
     })
-    // Enter picks the highlighted match rather than submitting the raw text.
+    // Enter stages the highlighted match rather than submitting the raw text.
     await act(async () => input.dispatchEvent(
       new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
     ))
-    expect(input.value).toBe('Alex Smith')
+    expect(stagedNames(rendered)).toEqual(['Alex Smith'])
+    expect(input.value).toBe('')
     expect(addCollaborator).not.toHaveBeenCalled()
   })
 
@@ -525,9 +565,11 @@ describe('ShareModal', () => {
     await typeDirectorySearch(rendered, 'alex')
     expect(rendered.textContent).toContain('Alexander')
     const exactOption = [...rendered.querySelectorAll<HTMLButtonElement>('[role="option"]')]
-      .find(option => option.textContent?.includes('Invite “alex” exactly'))
+      .find(option => option.textContent?.includes('Add “alex” exactly'))
     expect(exactOption).toBeDefined()
     await click(exactOption!)
+    expect(stagedNames(rendered)).toEqual(['alex'])
+    await click(button(rendered, 'Invite'))
     expect(addCollaborator).toHaveBeenCalledWith('alex', 'use', undefined)
   })
 
@@ -546,10 +588,9 @@ describe('ShareModal', () => {
     await typeDirectorySearch(rendered, 'dormant@example.com')
     expect(rendered.textContent).toContain('User search is temporarily unavailable.')
     expect(button(rendered, 'Invite').disabled).toBe(false)
-    const input = rendered.querySelector<HTMLInputElement>('input[aria-label="Search people"]')!
-    await act(async () => input.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-    ))
+    const input = peopleInput(rendered)
+    await pressKey(input, 'Enter')
+    await pressKey(input, 'Enter')
     expect(addCollaborator).toHaveBeenCalledWith('dormant@example.com', 'use', undefined)
     consoleError.mockRestore()
   })
@@ -594,9 +635,9 @@ describe('ShareModal', () => {
     expect(escape.defaultPrevented).toBe(true)
     expect(dialogSawEscape).not.toHaveBeenCalled()
     expect(listbox()).toBeNull()
-    await act(async () => input.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
-    ))
+    await pressKey(input, 'Enter')
+    expect(stagedNames(rendered)).toEqual(['alex'])
+    await pressKey(input, 'Enter')
     expect(addCollaborator).toHaveBeenCalledWith('alex', 'use', undefined)
 
     // Arrow keys reopen the list instead of moving a hidden highlight.
@@ -641,9 +682,117 @@ describe('ShareModal', () => {
     })
     expect(rendered.textContent).not.toContain('Ada Lovelace')
 
-    const input = rendered.querySelector<HTMLInputElement>('input[aria-label="Search people"]')!
+    const input = peopleInput(rendered)
     await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
-    expect(input.value).toBe('Grace Hopper')
+    expect(stagedNames(rendered)).toEqual(['Grace Hopper'])
+    expect(input.value).toBe('')
+  })
+
+  it('invites everyone staged with one role and one refetch', async () => {
+    const addCollaborator = vi.fn<NonNullable<OverseerOverrides['addCollaborator']>>(
+      async (userId, role) => profileFor(userId, role,
+        userId === 'ada@example.com' ? 'Ada Lovelace' : 'Grace Hopper'))
+    const listCollaborators = vi.fn<() => Promise<CollaboratorInfo[]>>(async () => [])
+    const searchUsers = vi.fn<NonNullable<AuthenticatedApiOverrides['searchUsers']>>(
+      async query => query === 'ada' ? [{ id: 'ada@example.com', name: 'Ada Lovelace' }] : [])
+    const rendered = await render(
+      fakeOverseer({ addCollaborator, listCollaborators }),
+      fakeAuthenticatedApi({ searchUsers }),
+    )
+    const loadsBefore = listCollaborators.mock.calls.length
+
+    await typeDirectorySearch(rendered, 'ada')
+    await click(rendered.querySelector<HTMLButtonElement>('[role="option"]')!)
+    await typeDirectorySearch(rendered, 'grace@example.com')
+    // A staged person is not suggested again.
+    expect(searchUsers).toHaveBeenLastCalledWith('grace@example.com', ['dan@cloudflare.com', 'ada@example.com'])
+    await pressKey(peopleInput(rendered), 'Enter')
+    expect(stagedNames(rendered)).toEqual(['Ada Lovelace', 'grace@example.com'])
+
+    await click(button(rendered, 'Invite 2 people'))
+
+    expect(addCollaborator).toHaveBeenCalledTimes(2)
+    expect(addCollaborator).toHaveBeenCalledWith('ada@example.com', 'use', undefined)
+    expect(addCollaborator).toHaveBeenCalledWith('grace@example.com', 'use', undefined)
+    expect(listCollaborators).toHaveBeenCalledTimes(loadsBefore + 1)
+    expect(stagedNames(rendered)).toEqual([])
+    expect(rendered.textContent).toContain('Added Ada Lovelace and Grace Hopper')
+    expect(toastAdd).toHaveBeenCalledWith({
+      title: 'Added Ada Lovelace and Grace Hopper as collaborators.',
+      variant: 'success',
+    })
+  })
+
+  it('counts the typed name in the Invite label and sends it with the chips', async () => {
+    const addCollaborator = vi.fn<NonNullable<OverseerOverrides['addCollaborator']>>(
+      async (userId, role) => profileFor(userId, role, userId))
+    const rendered = await render(
+      fakeOverseer({ addCollaborator }),
+      fakeAuthenticatedApi({ searchUsers: async () => [] }),
+    )
+
+    await typeDirectorySearch(rendered, 'ada@example.com')
+    await pressKey(peopleInput(rendered), 'Enter')
+    expect(button(rendered, 'Invite').disabled).toBe(false)
+    await typeDirectorySearch(rendered, 'grace@example.com')
+
+    await click(button(rendered, 'Invite 2 people'))
+
+    expect(addCollaborator).toHaveBeenCalledWith('ada@example.com', 'use', undefined)
+    expect(addCollaborator).toHaveBeenCalledWith('grace@example.com', 'use', undefined)
+  })
+
+  it('removes a chip with its button or Backspace on an empty field', async () => {
+    const addCollaborator = vi.fn<NonNullable<OverseerOverrides['addCollaborator']>>()
+    const rendered = await render(
+      fakeOverseer({ addCollaborator }),
+      fakeAuthenticatedApi({ searchUsers: async () => [] }),
+    )
+    const input = peopleInput(rendered)
+
+    await typeDirectorySearch(rendered, 'ada@example.com')
+    await pressKey(input, 'Enter')
+    await typeDirectorySearch(rendered, 'grace@example.com')
+    await pressKey(input, 'Enter')
+    expect(stagedNames(rendered)).toEqual(['ada@example.com', 'grace@example.com'])
+
+    await click(button(rendered, 'Remove ada@example.com'))
+    expect(stagedNames(rendered)).toEqual(['grace@example.com'])
+
+    await pressKey(input, 'Backspace')
+    expect(stagedNames(rendered)).toEqual([])
+    expect(button(rendered, 'Invite').disabled).toBe(true)
+    expect(addCollaborator).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unknown account on its chip while the others are added', async () => {
+    const addCollaborator = vi.fn<NonNullable<OverseerOverrides['addCollaborator']>>(
+      async (userId, role) => userId === 'nobody@example.com'
+        ? null
+        : profileFor(userId, role, 'Ada Lovelace'))
+    const rendered = await render(
+      fakeOverseer({ addCollaborator }),
+      fakeAuthenticatedApi({ searchUsers: async () => [] }),
+    )
+    const input = peopleInput(rendered)
+
+    await typeDirectorySearch(rendered, 'ada@example.com')
+    await pressKey(input, 'Enter')
+    await typeDirectorySearch(rendered, 'nobody@example.com')
+    await pressKey(input, 'Enter')
+    await pressKey(input, 'Enter')
+
+    expect(stagedNames(rendered)).toEqual(['nobody@example.com'])
+    expect(rendered.querySelector('[role="alert"]')?.textContent)
+      .toContain('nobody@example.com: No account found for that username or email.')
+    expect(toastAdd).toHaveBeenCalledWith({
+      title: 'Added Ada Lovelace as a collaborator.',
+      variant: 'success',
+    })
+    expect(toastAdd).not.toHaveBeenCalledWith(expect.objectContaining({ variant: 'error' }))
+    expect(rendered.textContent).toContain('Added Ada Lovelace')
+    expect(input.disabled).toBe(false)
+    expect(button(rendered, 'Invite').disabled).toBe(false)
   })
 
   it('does not expose results from the previous query', async () => {
@@ -861,8 +1010,10 @@ describe('ShareModal', () => {
 
     await invite(rendered, 'ada')
 
-    // The attempt reaches the server and its refusal is shown verbatim.
-    expect(toastAdd).toHaveBeenCalledWith({ title: refusal, variant: 'error' })
+    // The attempt reaches the server and its refusal is shown verbatim on the person's chip.
+    expect(stagedNames(rendered)).toEqual(['Ada'])
+    expect(rendered.querySelector('[role="alert"]')?.textContent).toContain(`Ada: ${refusal}`)
+    expect(toastAdd).not.toHaveBeenCalled()
   })
 
   it('does not rename a share link when its name did not change', async () => {
