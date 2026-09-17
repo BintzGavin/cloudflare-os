@@ -40,6 +40,8 @@ export class FakeProvider {
   readonly controls: ProviderControls = {};
   /** Refresh tokens the provider will no longer honour, by rotation or explicit revocation. */
   readonly revoked = new Set<string>();
+  /** Access tokens the provider still accepts. */
+  readonly activeAccessTokens = new Set<string>();
   /** Every project the provider holds, by id. */
   readonly projects = new Map<string, Project>();
   /** Per-user visibility, so a collaborator can legitimately lack access to one space. */
@@ -74,8 +76,10 @@ export class FakeProvider {
   /** @returns A newly issued grant, as both the first code exchange and a refresh produce. */
   mint(): Grant {
     this.#issued += 1;
+    const accessToken = `${this.principal}-access-${this.#issued}`;
+    this.activeAccessTokens.add(accessToken);
     return {
-      accessToken: `${this.principal}-access-${this.#issued}`,
+      accessToken,
       refreshToken: `${this.principal}-refresh-${this.#issued}`,
       scopes: ["projects:read", "projects:write"],
       expiresAt: Date.now() + 3_600_000,
@@ -83,9 +87,8 @@ export class FakeProvider {
   }
 
   #check(grant: PublicGrant): void {
-    if (this.controls.rejectCredentials) throw new ProviderAuthError("401 unauthorized");
-    if (grant.accessToken !== `${this.principal}-access-${this.#issued}`) {
-      throw new ProviderAuthError("401 token belongs to another principal");
+    if (this.controls.rejectCredentials || !this.activeAccessTokens.has(grant.accessToken)) {
+      throw new ProviderAuthError("401 unauthorized");
     }
   }
 
