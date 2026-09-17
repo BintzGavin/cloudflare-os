@@ -388,6 +388,21 @@ export const createAuthError = authErrors.create;
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
 
+/**
+ * One user as listed in the deployment-wide user directory (see
+ * `AuthenticatedApi.searchUsers`).
+ */
+export type UserDirectoryRecord = {
+  /**
+   * Canonical user identifier: email for Access / sign-in accounts, username
+   * for password accounts.
+   */
+  id: string;
+
+  /** The user's current display name. */
+  name: string;
+};
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
@@ -395,6 +410,21 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;
+
+  /**
+   * Find other users of this deployment by a case-insensitive substring of
+   * their display name or id, for inviting collaborators. Excludes the caller
+   * and every user named by `excludeIds`. Returns at most 10 records, earliest
+   * substring match first.
+   *
+   * Rejects a `query` longer than 1000 characters or containing a line break,
+   * and more than 1000 distinct ids to exclude, the caller's own included.
+   *
+   * Returns no records while the admin has user search turned off
+   * (`ServerConfig.userSearchEnabled`); inviting by exact username/email via
+   * `Overseer.addCollaborator()` still works then.
+   */
+  searchUsers(query: string, excludeIds: string[]): Promise<UserDirectoryRecord[]>;
 
   /**
    * Change the user's password, if using password-based authentication.
@@ -907,6 +937,8 @@ export const MAX_SITE_LOGO_DIMENSION = 512;
 export type AdminSettingsView = {
   /** Whether new account signups are allowed. */
   signupsEnabled: boolean;
+  /** Whether users may search the user directory to find collaborators. */
+  userSearchEnabled: boolean;
   /** Site name shown next to the top-bar logo ("" falls back to DEFAULT_SITE_NAME). */
   siteName: string;
   /** Custom deployment logo, or undefined to use the default Cloudflare OS mark. */
@@ -961,8 +993,8 @@ export type AdminFormat = {
   missing: boolean;
 
   /**
-   * The blueprint ships with the deployment (see format-blueprints/ and the FORMAT_BLUEPRINTS the
-   * build generates from it), so an upgrade can replace its contents. Curation stays the admin's: an upgrade never re-promotes something they
+   * The blueprint ships with the deployment (see packages/bundled-blueprints and the
+   * BUNDLED_BLUEPRINTS the backend's build generates from it), so an upgrade can replace its contents. Curation stays the admin's: an upgrade never re-promotes something they
    * removed, nor resets their overrides.
    */
   bundled: boolean;
@@ -981,6 +1013,12 @@ export interface AdminApi {
 
   /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
   setSignupsEnabled(enabled: boolean): Promise<void>;
+
+  /**
+   * Enable or disable user directory search. The directory itself is maintained
+   * either way, and this switch just controls user access.
+   */
+  setUserSearchEnabled(enabled: boolean): Promise<void>;
 
   /**
    * Set the site name shown next to the top-bar logo. Pass "" to reset to DEFAULT_SITE_NAME.
@@ -1128,6 +1166,13 @@ export type ServerConfig = {
   signupsEnabled: boolean;
 
   /**
+   * Whether users may search the user directory to find collaborators. When not explicitly
+   * configured, this defaults to the opposite of `signupsEnabled`. When false the share UI offers
+   * only an exact username/email field.
+   */
+  userSearchEnabled: boolean;
+
+  /**
    * Site name shown next to the top-bar logo (admin-configurable). Empty falls back to
    * DEFAULT_SITE_NAME.
    */
@@ -1228,11 +1273,25 @@ export type AiModelConfig = {
  */
 export const WORKERS_AI_OUTPUT_LIMIT = 32768;
 
-/**
- * Models offered in the picker. `contextWindow` is the maximum tokens one request may total.
- * `outputLimit`, when present, is both the requested response cap and the space reserved for it,
- * leaving the remainder as the prompt budget context compaction sizes against.
- */
+/** One entry of SUGGESTED_MODELS. */
+type SuggestedModel = {
+  name: string;
+
+  /** The maximum tokens one request may total. */
+  contextWindow: number;
+
+  /** When present, both the requested response cap and the space reserved for it. */
+  outputLimit?: number;
+
+  /**
+   * When present, the prompt size compaction keeps the chat under. Set below the window for models
+   * whose input is priced higher past a threshold (GPT-5.6 doubles above 272K), so ordinary use
+   * stays in the cheaper tier while the window remains the hard limit.
+   */
+  compactionInputBudget?: number;
+};
+
+// The literal is kept apart from the export so SuggestedModelId can derive the model ids from it.
 const SUGGESTED_MODEL_CATALOG = {
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
@@ -1259,24 +1318,29 @@ const SUGGESTED_MODEL_CATALOG = {
     "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
   },
   "openai": {
-    "gpt-5.6-sol": {name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-luna": {name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-terra": {name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000},
+    "gpt-5.6-sol": {
+      name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
+    "gpt-5.6-luna": {
+      name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
+    "gpt-5.6-terra": {
+      name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000,
+      compactionInputBudget: 272000,
+    },
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
   },
   "ollama": {
   },
-} satisfies Record<
-  AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
->;
+} satisfies Record<AiModelProvider, Record<string, SuggestedModel>>;
 
-export const SUGGESTED_MODELS: Record<
-  AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
-> = SUGGESTED_MODEL_CATALOG;
+/** Models offered in the picker, by provider and model id. */
+export const SUGGESTED_MODELS: Record<AiModelProvider, Record<string, SuggestedModel>> =
+    SUGGESTED_MODEL_CATALOG;
 
 /** A model ID listed in SUGGESTED_MODELS, optionally narrowed to one provider's catalog. */
 export type SuggestedModelId<P extends AiModelProvider = AiModelProvider> =
@@ -1664,8 +1728,9 @@ export type BoundHookInfo = {
  * create new agents, that is, start new agent chat threads, which appear in the gadget's agent
  * chat UI as new conversations. Agents created this way don't typically edit the gadget code, but
  * rather use the `executeCode` tool to directly invoke the gadget's bindings to perform tasks.
- * Each agent can additionally be provide "props" which may include additional RPC stubs
- * representing specific resources or callbacks relevant to that agent session.
+ * Beyond the bindings configured here, a gadget hands an agent per-task capabilities -- RPC stubs
+ * representing specific resources or callbacks relevant to that agent session -- as the arguments
+ * of calls made on the stub that the binding's `spawnCallable()` returns.
  *
  * For example, a gadget that responds to emails might invoke an agent for each email message that
  * arrives, with an RPC stub that allows it to reply to that email -- but prohibits the agent from
@@ -1678,8 +1743,8 @@ export type AgentSpawnerConfig = {
 
   /**
    * Model ID to run, of the gadget owner's available models. Can be `null` to just create a chat
-   * that doesn't actually run an agent -- the chat will be notified that the chat needs attention,
-   * same as for an agent chat where the agent fails to mark the task complete.
+   * that doesn't actually run an agent -- the prompt, or the calls made on a callable agent, are
+   * appended to the chat for a human to pick up.
    */
   modelId: string | null,
 
@@ -2981,23 +3046,29 @@ export type AiChatMessageBody = {
   code?: string;
 } | {
   /**
-   * Indicates that a callback was received on the agent's `self` object. When the agent uses
-   * `executeCode`, the executed code receives a `self` parameter. Calling any method on `self`
-   * (e.g., `self.onUpdate(data)`) delivers a callback message back to this chat thread and
-   * activates the agent to respond.
+   * Indicates that a call was delivered to the agent: a method was called on its `self` object
+   * (which code run by the agent's `executeCode` tool receives, and may pass along or store) or on
+   * the stub an agent spawner's `spawnCallable()` returned. The call activates the agent to
+   * respond; nothing is returned to the caller.
    */
   type: "agentCallback";
 
-  /** The method name that was called on `self`. */
+  /** The method name that was called. */
   methodName: string;
 
   /** A depth-limited summary string of the arguments for the agent's context window. */
   argsSummary: string;
+
+  /**
+   * Name under which the arguments appear in the agent's `env`. Absent on messages from before
+   * callable agents became durable, whose arguments are no longer available.
+   */
+  bindingName?: string;
 } | {
   /**
-   * A system-generated nudge message sent to the agent when it tries to end its turn while
-   * agent callbacks are still unresolved. This is displayed as a user message to the LLM
-   * so it can be prompted to continue.
+   * **Obsolete.** A system-generated nudge message that was sent to the agent when it tried to
+   * end its turn while agent callbacks were still unresolved. No longer emitted since callable
+   * agents stopped returning values; retained so older chat logs remain readable.
    */
   type: "agentNudge";
   text: string;
@@ -3307,6 +3378,11 @@ export type AiToolCall = {
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
 } | {
+  /**
+   * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
+   * emitted since callable agents stopped returning values; retained so older chat logs remain
+   * readable.
+   */
   toolName: "giveUp";
   input: {
     error: string;
