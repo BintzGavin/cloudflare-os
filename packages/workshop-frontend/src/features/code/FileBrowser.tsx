@@ -8,8 +8,8 @@ import DeleteConfirmationDialog from '../../components/DeleteConfirmationDialog'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput } from '../../components/WorkshopControls'
 import { isImeComposing } from '../../keyboardEvent'
 import {
-  ancestorDirs, type BrowserNode, type BrowserTree, type ChangedFile, type FileChangeStatus,
-  type LeafKind,
+  ancestorDirs, resolveRenamePath, type BrowserNode, type BrowserTree, type ChangedFile,
+  type FileChangeStatus, type LeafKind,
 } from './workpieceTree'
 
 // The code view's file browser: a Changes list (the files that differ from the review base, flat,
@@ -163,12 +163,19 @@ export default function FileBrowser({
   }
 
   // The rename input edits the leaf's name within its directory; a name containing '/' moves the
-  // file relative to that directory.
+  // file relative to that directory (see resolveRenamePath for `..` and root-relative forms).
   const commitRename = (path: string, nextName: string) => {
     const trimmed = nextName.trim()
-    const slash = path.lastIndexOf('/')
-    const nextPath = (slash >= 0 ? path.slice(0, slash + 1) : '') + trimmed
-    if (!trimmed || nextPath === path) {
+    if (!trimmed) {
+      setRenaming(null)
+      return
+    }
+    const nextPath = resolveRenamePath(path, trimmed)
+    if (nextPath === null) {
+      toasts.add({ title: 'Invalid file path', variant: 'error' })
+      return
+    }
+    if (nextPath === path) {
       setRenaming(null)
       return
     }

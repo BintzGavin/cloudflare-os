@@ -1346,12 +1346,18 @@ export default function WorkpieceCodeInterface({
   const activeFileOversized = activeFileText !== null && activeFileText.length > MAX_FILE_TEXT_LENGTH
   // The diff's original side: the review base's text (null = absent there: an added file). The
   // diff waits for that read too, so a file never opens as "added" for the round trip before
-  // its original arrives.
+  // its original arrives. An original with no readable text (a binary the chat replaced or
+  // deleted) is stood in for by its explanation, so the diff reads as a change to an existing
+  // file -- what the Changes list reports it as -- rather than as an addition or an empty
+  // deletion.
   const activeReview = activeFile !== null ? reviewFiles.get(activeFile) : undefined
   const activeReviewLoading = isDiffMode && activeFile !== null && reviewBase !== undefined &&
     activeReview === undefined
-  const activeFileOriginal = activeReview !== undefined && 'text' in activeReview
-    ? activeReview.text : null
+  const activeFileOriginal = activeReview === undefined || 'absent' in activeReview
+    ? null
+    : 'text' in activeReview
+      ? activeReview.text
+      : `(${activeReview.unreadable}; its previous content cannot be shown)`
   // Either of the open file's two reads failing is shown in its pane, with a retry.
   const activeFileError = (activeResolved === undefined ? activeBaseError : null) ??
     (activeReviewLoading ? reviewError : null)

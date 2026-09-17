@@ -149,6 +149,29 @@ export function ancestorDirs(path: string): string[] {
 }
 
 /**
+ * The destination of renaming `path` to the name typed in its row: a name relative to the file's
+ * own directory, so a bare name renames in place and `sub/name` moves down a level. A file is
+ * moved *up* with `..` segments (`../name`), or anywhere with a leading `/` (root-relative).
+ * Returns `null` for a destination that climbs above the root or ends in an empty segment.
+ */
+export function resolveRenamePath(path: string, name: string): string | null {
+  const dir = path.slice(0, path.lastIndexOf('/') + 1)
+  const raw = name.startsWith('/') ? name.slice(1) : dir + name
+  const out: string[] = []
+  for (const segment of raw.split('/')) {
+    if (segment === '') return null
+    if (segment === '.') continue
+    if (segment === '..') {
+      if (out.length === 0) return null
+      out.pop()
+    } else {
+      out.push(segment)
+    }
+  }
+  return out.length > 0 ? out.join('/') : null
+}
+
+/**
  * A touched path's status against the review base. `displayed` is the text the view shows for
  * the path (`null` when the chat removed it); `original` is its content at the review base, or
  * `undefined` while that read is in flight -- then no status is known yet, unless there is no

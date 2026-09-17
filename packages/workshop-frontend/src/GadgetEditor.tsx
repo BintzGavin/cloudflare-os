@@ -846,10 +846,16 @@ export default function GadgetEditor() {
   // Wait for all initial subscriptions before choosing the new-workspace chat-only layout.
   const simpleMode = layoutModeReady && !hasCodeRelatedState && !hasCommittedCode
     && singleInitialChat && visibleWorkpieces.length <= 1
+  // The rail lists every workpiece in the workspace (picking another chat's draft or worktree
+  // navigates to that chat), but the pane can only show one visible for the selected chat, so
+  // it opens for an app only when there is one: with no chat selected in a workspace of drafts
+  // and worktrees alone, an open pane would be empty -- and on mobile would replace the chat
+  // list.
   const hasAnyApps = allGadgets.length > 0 || allWorktrees.length > 0
+  const hasVisibleWorkpieces = visibleWorkpieces.length > 0
   const showingActivity = workspaceView?.mode === 'activity'
   const showFullEditor = layoutModeReady && (
-    showingActivity || (hasAnyApps && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
+    showingActivity || (hasVisibleWorkpieces && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
   )
   const showOutputRail = layoutModeReady && hasAnyApps && !showFullEditor
   const paneShowsActivity = showingActivity || activityClosing
@@ -965,12 +971,12 @@ export default function GadgetEditor() {
     }
     setWorkspaceTransitionEnabled(true)
     const returnView = activityReturnViewRef.current
-    const returnShowsPane = returnView?.mode === 'app'
-      || (returnView === null && hasAnyApps && !simpleMode)
+    const returnShowsPane = hasVisibleWorkpieces && (returnView?.mode === 'app'
+      || (returnView === null && !simpleMode))
     setActivityClosing(!returnShowsPane)
     setWorkspaceView(returnView)
     activityReturnViewRef.current = null
-  }, [workspaceView, setWorkspaceVisibility, hasAnyApps, simpleMode])
+  }, [workspaceView, setWorkspaceVisibility, hasVisibleWorkpieces, simpleMode])
 
   // Ignore the initial listing, then open apps created by the active chat.
   useEffect(() => {

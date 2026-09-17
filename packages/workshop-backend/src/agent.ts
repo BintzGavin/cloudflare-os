@@ -1503,17 +1503,27 @@ export async function runAgent(
   // checks against the head it is about to pin at, exactly like an unpinned read's. An entry
   // whose file is absent from the session content (removed, or -- at a conversion boundary --
   // from the retired legacy representation, which leaves no session content) is dropped, so
-  // editFile forces a re-read. Stamped entries carry over untouched.
+  // editFile forces a re-read.
+  //
+  // A stamped entry normally carries over untouched: its workpiece was unpinned (a pinned
+  // gadget's stamps were settled by anchorKnowledgeToPin), so the session holds nothing of the
+  // file and the stamp is as true after the accept as before. The exception is a worktree,
+  // whose stamps are never settled at its pin: a *user* edit of a file the model read unpinned
+  // lands in the session content while the entry keeps the pre-edit stamp (the model's own
+  // edits re-mark the entry as session knowledge; a user's, shown to it as a diff, do not). The
+  // accept commits that edited content, so the entry is restamped from it like a
+  // session-tracking one -- else the next epoch's gate would refuse the edit as stale content
+  // the model in fact saw. A stamped path the session removed is dropped the same way.
   let resetSessionEpoch = async () => {
     for (let [workpieceId, files] of filesRead) {
       let content = sessionContent.get(workpieceId);
+      let removed = worktreeRemovedPaths.get(workpieceId);
       for (let [filename, stamp] of files) {
-        if (stamp !== undefined) continue;
         let text = content?.get(filename);
-        if (text === undefined) {
-          files.delete(filename);
-        } else {
+        if (text !== undefined) {
           files.set(filename, await blobOid(text));
+        } else if (stamp === undefined || removed?.has(filename)) {
+          files.delete(filename);
         }
       }
     }

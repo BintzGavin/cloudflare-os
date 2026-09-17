@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { TreeNode } from '@gadgets/workshop-shared/api'
 import {
   ancestorDirs, browserTreePaths, buildBrowserTree, deriveChanges, fileChangeStatus,
-  type BrowserNode,
+  resolveRenamePath, type BrowserNode,
 } from './workpieceTree'
 
 const BASE: TreeNode[] = [
@@ -119,6 +119,27 @@ describe('ancestorDirs', () => {
   it('names each directory above the path', () => {
     expect(ancestorDirs('a/b/c.ts')).toEqual(['a', 'a/b'])
     expect(ancestorDirs('top.ts')).toEqual([])
+  })
+})
+
+describe('resolveRenamePath', () => {
+  it('resolves the typed name against the file\'s own directory', () => {
+    expect(resolveRenamePath('src/a.ts', 'b.ts')).toBe('src/b.ts')
+    expect(resolveRenamePath('src/a.ts', 'sub/b.ts')).toBe('src/sub/b.ts')
+    expect(resolveRenamePath('top.ts', 'b.ts')).toBe('b.ts')
+  })
+
+  it('moves up with `..` and anywhere with a leading slash', () => {
+    expect(resolveRenamePath('src/a.ts', '../a.ts')).toBe('a.ts')
+    expect(resolveRenamePath('src/deep/a.ts', '../other/./a.ts')).toBe('src/other/a.ts')
+    expect(resolveRenamePath('src/deep/a.ts', '/lib/a.ts')).toBe('lib/a.ts')
+  })
+
+  it('rejects a destination above the root or with an empty segment', () => {
+    expect(resolveRenamePath('src/a.ts', '../../a.ts')).toBeNull()
+    expect(resolveRenamePath('top.ts', '..')).toBeNull()
+    expect(resolveRenamePath('src/a.ts', 'sub//a.ts')).toBeNull()
+    expect(resolveRenamePath('src/a.ts', 'dir/')).toBeNull()
   })
 })
 
