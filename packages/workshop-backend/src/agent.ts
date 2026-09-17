@@ -1589,6 +1589,19 @@ async function runAgentPass(
     return hooks.getGadgetHead(workpieceId);
   };
 
+  // Whether a tool call in the assistant message at `index` saw content the user later reverted.
+  // The message's own status covers a revert that reaches back over the whole step; but the
+  // step's edits land in a "changes" message written right *after* the tool-call message in the
+  // same barrier (see commitAgentStep), and a revert of just the step starts there, leaving the
+  // tool-call message unmarked. So that next message is checked too: a read that followed an edit
+  // in the same step saw that edit.
+  let sawRevertedContent = (index: number): boolean => {
+    if (chatMessageStatus.get(chatMessages[index].sequence) === "reverted") return true;
+    let next = chatMessages[index + 1];
+    return next?.type === "changes" && next.author.type === "agent" &&
+        chatMessageStatus.get(next.sequence) === "reverted";
+  };
+
   // We compute sequential change ID numbers for the purpose of telling the LLM about reverts.
   let nextChangeId = checkpoint?.nextChangeId ?? 0;
 
@@ -1629,7 +1642,7 @@ async function runAgentPass(
     applyReplayedChange(checkpoint.proposedChange, false);
   }
 
-  for (let msg of chatMessages) {
+  for (let [msgIndex, msg] of chatMessages.entries()) {
     let modelMessageStart = modelMessages.length;
     let msgTimestamp = msg.timestamp.getTime();
     switch (msg.type) {
@@ -1785,7 +1798,7 @@ async function runAgentPass(
                 // Note that if we get here, we know the tool succeeded originally, so for many
                 // branches below we can just return success unconditionally.
                 case "readFile": {
-                  if (chatMessageStatus.get(msg.sequence) === "reverted") {
+                  if (sawRevertedContent(msgIndex)) {
                     // It would be a total waste of tokens to actually include this file
                     // content in the chat history since it contains changes that were later
                     // reverted -- not to mention a waste of resources to compute the content
