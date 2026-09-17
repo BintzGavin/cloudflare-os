@@ -241,6 +241,9 @@ describe('ShareModal', () => {
     container = undefined
   })
 
+  // The last render's element, with its metadata swappable, so a test can deliver a live update.
+  let renderWithMetadata: ((metadata: GadgetMetadata) => ReactElement) | undefined
+
   async function render(
     overseer: RpcStub<Overseer>,
     authenticatedApi = fakeAuthenticatedApi(),
@@ -251,23 +254,26 @@ describe('ShareModal', () => {
     document.body.append(container)
     root = createRoot(container)
     const serverConfig = { userSearchEnabled } as ServerConfig
-    await act(async () => {
-      root!.render(
-        <ServerConfigContext.Provider value={serverConfig}>
-          <ShareModal
-            open
-            onClose={() => {}}
-            overseer={overseer}
-            metadata={metadata}
-            currentUser={CURRENT_USER}
-            authenticatedApi={authenticatedApi}
-          />
-        </ServerConfigContext.Provider>
-      )
-    })
+    renderWithMetadata = currentMetadata => (
+      <ServerConfigContext.Provider value={serverConfig}>
+        <ShareModal
+          open
+          onClose={() => {}}
+          overseer={overseer}
+          metadata={currentMetadata}
+          currentUser={CURRENT_USER}
+          authenticatedApi={authenticatedApi}
+        />
+      </ServerConfigContext.Provider>
+    )
+    await act(async () => { root!.render(renderWithMetadata!(metadata)) })
     // Let the load effects settle.
     await act(async () => { await Promise.resolve() })
     return document.body
+  }
+
+  async function updateMetadata(metadata: GadgetMetadata) {
+    await act(async () => { root!.render(renderWithMetadata!(metadata)) })
   }
 
   it('reveals the workspace link to send after a direct invite', async () => {
@@ -857,6 +863,8 @@ describe('ShareModal', () => {
     }), fakeAuthenticatedApi(), latchedMetadata)
 
     expect(rendered.textContent).toContain('doesn’t allow share links')
+    expect(rendered.textContent).toContain('Invite people.')
+    expect(rendered.textContent).not.toContain('share a link.')
     expect(rendered.textContent).not.toContain('This workspace has read sensitive data')
     // The link restriction adds to the restricted-data caveats rather than replacing them.
     expect(rendered.textContent).toContain('verify their own access')
@@ -885,10 +893,33 @@ describe('ShareModal', () => {
     }), fakeAuthenticatedApi(), latchedMetadata)
 
     expect(rendered.textContent).toContain('only the owner can add people')
+    expect(rendered.textContent).toContain('Manage access.')
+    expect(rendered.textContent).not.toContain('Invite people')
     expect(rendered.querySelector('input[aria-label="Search people"]')).toBeNull()
     expect(rendered.textContent).not.toContain('Create a share link')
     expect(rendered.textContent).not.toContain('Recipient verification')
     expect(rendered.textContent).toContain('People with access')
+  })
+
+  it('releases the results scroll lock when a live update latches a collaborator out of inviting', async () => {
+    const collaboratorMetadata = {
+      ...METADATA,
+      owner: { type: 'user', id: 'owner@cloudflare.com', name: 'Owner' },
+    } as GadgetMetadata
+    const rendered = await render(fakeOverseer(), fakeAuthenticatedApi(), collaboratorMetadata)
+    const body = () => rendered.querySelector<HTMLElement>('.chat-panel')!
+
+    await typeDirectorySearch(rendered, 'ada')
+    expect(rendered.querySelector('[role="listbox"]')).not.toBeNull()
+    expect(body().classList).toContain('overflow-hidden')
+
+    // Another session latches the workspace while the results are open: the search field goes
+    // away without ever blurring, and the body must scroll again.
+    await updateMetadata({ ...collaboratorMetadata, ownerInvitesOnly: true } as GadgetMetadata)
+    expect(rendered.querySelector('input[aria-label="Search people"]')).toBeNull()
+    expect(rendered.querySelector('[role="listbox"]')).toBeNull()
+    expect(body().classList).toContain('overflow-y-auto')
+    expect(body().classList).not.toContain('overflow-hidden')
   })
 
   it('surfaces the server’s refusal when sharing is no longer allowed', async () => {
