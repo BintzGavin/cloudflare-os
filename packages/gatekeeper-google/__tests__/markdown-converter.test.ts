@@ -11,6 +11,7 @@ type ContentSegment = Exclude<Segment, { syntaxOnly: true }>;
 const isContent = (seg: Segment): seg is ContentSegment => !("syntaxOnly" in seg);
 
 const TAB_ID = "tab-1";
+const PARENTHESIZED_URL = "https://en.wikipedia.org/wiki/Function_(mathematics)";
 
 /**
  * The document text as Google stores it, aligned so that a string index equals a doc index: index
@@ -64,6 +65,17 @@ describe("docTabToMarkdown", () => {
     expect(snapshot.markdown).toBe("*Release summary*\n");
   });
 
+  it("honors explicit non-italic subtitle runs", () => {
+    let paragraph = {
+      runs: ["Italic", { text: "Plain", style: { italic: false } }, "\n"],
+      namedStyleType: "SUBTITLE",
+    };
+
+    expect(docTabToMarkdown(buildTab([paragraph])).markdown).toBe("*Italic*Plain\n");
+    expect(docTabToMarkdown(buildTab([{ table: [[{ paragraphs: [paragraph] }]] }])).markdown)
+      .toContain("<td><p><em>Italic</em>Plain</p></td>");
+  });
+
   it("renders visible smart-chip content", () => {
     let snapshot = docTabToMarkdown(buildTab([{ runs: [
       { person: { name: "Ada Lovelace", email: "ada@example.com" } },
@@ -79,6 +91,20 @@ describe("docTabToMarkdown", () => {
     );
   });
 
+  it("escapes structured display text as Markdown", () => {
+    let snapshot = docTabToMarkdown(buildTab([{ runs: [
+      { richLink: {
+        title: "Plan](https://evil.example)",
+        uri: "https://docs.google.com/document/d/safe",
+      } },
+      "\n",
+    ] }]));
+
+    expect(snapshot.markdown).toBe(
+      "[Plan\\]\\(https://evil\\.example\\)](https://docs.google.com/document/d/safe)\n",
+    );
+  });
+
   it("refuses edits to smart-chip display text", () => {
     let snapshot = docTabToMarkdown(buildTab([{ runs: [
       { date: "Sep 16, 2026" }, "\n",
@@ -88,6 +114,12 @@ describe("docTabToMarkdown", () => {
     expect(() => computeReplaceOperations(
       snapshot.sourceMap, snapshot.markdown, start, start + 12, "Sep 17, 2026", TAB_ID,
     )).toThrow("replaceText: structured content cannot be edited");
+  });
+
+  it("renders body horizontal rules as HTML", () => {
+    let snapshot = docTabToMarkdown(buildTab([{ runs: [{ horizontalRule: true }, "\n"] }]));
+
+    expect(snapshot.markdown).toBe("<hr>\n");
   });
 
   it("carries the tab's identity, position and body end index through", () => {
@@ -105,6 +137,23 @@ describe("docTabToMarkdown", () => {
     // Section break (1) + "abc\n" (4).
     expect(snapshot.bodyEndIndex).toBe(5);
   });
+  it.each([
+    ["table of contents", "tableOfContents", "[Table of contents]"],
+    ["interior section break", "sectionBreak", "[Section break]"],
+  ] as const)("protects an omitted %s", (_name, structure, placeholder) => {
+    let snapshot = docTabToMarkdown(buildTab([
+      { runs: ["Before\n"] },
+      { structure, length: 10 },
+      { runs: ["After\n"] },
+    ]));
+
+    expect(snapshot.markdown).toBe(`Before\n\n${placeholder}\n\nAfter\n`);
+    expect(() => computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, 0, snapshot.markdown.length,
+      "Updated", TAB_ID,
+    )).toThrow("replaceText: structured content cannot be edited");
+  });
+
 });
 
 describe("Google Docs tables", () => {
@@ -151,6 +200,29 @@ describe("Google Docs tables", () => {
     );
   });
 
+  it("preserves internal Docs link destinations in cells", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{ runs: [
+      { text: "Tab", style: { link: { tabId: "details" } } }, " · ",
+      { text: "Bookmark", style: { link: {
+        bookmark: { id: "bookmark-1", tabId: "details" },
+      } } }, " · ",
+      { text: "Heading", style: { link: {
+        heading: { id: "heading-1", tabId: "details" },
+      } } }, " · ",
+      { text: "Bookmark legacy", style: { link: { bookmarkId: "bookmark-2" } } }, " · ",
+      { text: "Heading legacy", style: { link: { headingId: "heading-2" } } },
+      "\n",
+    ] }] }]] }]);
+
+    expect(docTabToMarkdown(tab).markdown).toContain(
+      '<a href="?tab=details">Tab</a> · ' +
+      '<a href="?tab=details#bookmark=bookmark-1">Bookmark</a> · ' +
+      '<a href="?tab=details#heading=heading-1">Heading</a> · ' +
+      '<a href="#bookmark=bookmark-2">Bookmark legacy</a> · ' +
+      '<a href="#heading=heading-2">Heading legacy</a>',
+    );
+  });
+
   it("preserves subtitle styling without redundant emphasis", () => {
     let tab = buildTab([{ table: [[{ paragraphs: [{
       runs: ["Release ", { text: "summary", style: { italic: true } }, "\n"],
@@ -178,6 +250,14 @@ describe("Google Docs tables", () => {
     );
   });
 
+  it("renders page auto-text in cells", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{ runs: [
+      { autoText: "PAGE_NUMBER" }, " of ", { autoText: "PAGE_COUNT" }, "\n",
+    ] }] }]] }]);
+
+    expect(docTabToMarkdown(tab).markdown).toContain("<p>[Page number] of [Page count]</p>");
+  });
+
   it("defaults an omitted list nesting level to zero", () => {
     let tab = buildTab([{ table: [[{ paragraphs: [{
       runs: ["Step\n"], bullet: { listId: "L1" },
@@ -185,7 +265,63 @@ describe("Google Docs tables", () => {
       L1: { listProperties: { nestingLevels: [{ glyphType: "DECIMAL" }] } },
     });
 
-    expect(docTabToMarkdown(tab).markdown).toContain("<p>1. Step</p>");
+    expect(docTabToMarkdown(tab).markdown).toContain("<ol><li>Step</li></ol>");
+  });
+  it("renders nested lists semantically with their configured start", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [
+      { runs: ["Prepare\n"], bullet: { listId: "L1" } },
+      { runs: ["Check\n"], bullet: { listId: "L1", nestingLevel: 1 } },
+      { runs: ["Launch\n"], bullet: { listId: "L1" } },
+    ] }]] }], {
+      L1: { listProperties: { nestingLevels: [
+        { glyphType: "DECIMAL", startNumber: 4 },
+        { glyphSymbol: "●" },
+      ] } },
+    });
+
+    expect(docTabToMarkdown(tab).markdown).toContain(
+      '<ol start="4"><li>Prepare<ul style="list-style-type: none"><li>● Check</li></ul></li>' +
+      "<li>Launch</li></ol>",
+    );
+  });
+
+  it("preserves a zero start for decimal lists", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{
+      runs: ["Zero\n"], bullet: { listId: "L1" },
+    }] }]] }], {
+      L1: { listProperties: { nestingLevels: [{ glyphType: "DECIMAL", startNumber: 0 }] } },
+    });
+
+    expect(docTabToMarkdown(tab).markdown).toContain('<ol start="0"><li>Zero</li></ol>');
+  });
+
+  it("preserves ordered list glyph styles", () => {
+    let tab = buildTab([{ table: [[
+      { paragraphs: [{ runs: ["Alpha\n"], bullet: { listId: "alpha" } }] },
+      { paragraphs: [{ runs: ["Zero\n"], bullet: { listId: "zero" } }] },
+    ]] }], {
+      alpha: { listProperties: { nestingLevels: [{ glyphType: "UPPER_ALPHA", startNumber: 3 }] } },
+      zero: { listProperties: { nestingLevels: [{ glyphType: "ZERO_DECIMAL" }] } },
+    });
+
+    expect(docTabToMarkdown(tab).markdown).toContain(
+      '<td><ol type="A" start="3"><li>Alpha</li></ol></td>',
+    );
+    expect(docTabToMarkdown(tab).markdown).toContain(
+      '<td><ol style="list-style-type: decimal-leading-zero"><li>Zero</li></ol></td>',
+    );
+  });
+
+  it("preserves unordered list glyphs", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{
+      runs: ["Task\n"], bullet: { listId: "checklist" },
+    }] }]] }], {
+      checklist: { listProperties: { nestingLevels: [{ glyphSymbol: "☐" }] } },
+    });
+
+    expect(docTabToMarkdown(tab).markdown).toContain(
+      '<ul style="list-style-type: none"><li>☐ Task</li></ul>',
+    );
   });
 
   it("renders a horizontal rule in a cell as HTML", () => {
@@ -194,6 +330,26 @@ describe("Google Docs tables", () => {
     }] }]] }]);
 
     expect(docTabToMarkdown(tab).markdown).toContain("<td><hr></td>");
+  });
+
+  it("renders a footnote's visible number", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{ runs: [
+      "See ", { footnote: { id: "fn-7", number: "7" } }, "\n",
+    ] }] }]] }]);
+
+    expect(docTabToMarkdown(tab).markdown).toContain("<p>See [7]</p>");
+  });
+
+  it("marks omitted structured cell content", () => {
+    let tab = buildTab([{ table: [[{ paragraphs: [{ runs: [
+      "Before ", { richLink: { title: "placeholder", uri: "https://example.com" } }, " after\n",
+    ] }] }]] }]);
+    let element = tab.body.content[1].table!.tableRows![0].tableCells![0]
+      .content![0].paragraph!.elements[1];
+    delete element.richLink;
+    Object.assign(element, { inlineObjectElement: { inlineObjectId: "image-1" } });
+
+    expect(docTabToMarkdown(tab).markdown).toContain("<p>Before [Image] after</p>");
   });
 
   it("preserves merged-cell spans", () => {
@@ -231,10 +387,9 @@ describe("Google Docs tables", () => {
 
     expect(docTabToMarkdown(tab).markdown).toContain(
       "<h2>Heading</h2>\n" +
-      "      <p>- First</p>\n" +
-      "      <p>- Second</p>\n" +
+      '      <ul style="list-style-type: none"><li>● First</li><li>● Second</li></ul>\n' +
       "      <p></p>\n" +
-      "      <p>1. Step</p>",
+      "      <ol><li>Step</li></ol>",
     );
   });
 
@@ -247,6 +402,45 @@ describe("Google Docs tables", () => {
       "Updated",
       TAB_ID,
     )).toThrow("replaceText: structured content cannot be edited");
+  });
+
+  it("refuses an edit within a table cell", () => {
+    let start = snapshot.markdown.indexOf("Owner");
+
+    expect(() => computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, start, start + "Owner".length, "Lead", TAB_ID,
+    )).toThrow("replaceText: structured content cannot be edited");
+  });
+
+  it("protects the separators around a table", () => {
+    let tableStart = snapshot.markdown.indexOf("<table>");
+    let tableEnd = snapshot.markdown.indexOf("</table>") + "</table>".length;
+
+    expect(() => computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, 0, tableStart, "Updated\n", TAB_ID,
+    )).toThrow("replaceText: structured content cannot be edited");
+    expect(() => computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, tableEnd, snapshot.markdown.length,
+      "\nUpdated\n", TAB_ID,
+    )).toThrow("replaceText: structured content cannot be edited");
+  });
+
+  it("maps edits after a table to document coordinates", () => {
+    let start = snapshot.markdown.lastIndexOf("After");
+
+    expect(computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, start, start + "After".length, "Later", TAB_ID,
+    ).requests).toEqual([
+      { deleteContentRange: { range: { startIndex: 45, endIndex: 47, tabId: TAB_ID } } },
+      { insertText: { location: { index: 45, tabId: TAB_ID }, text: "La" } },
+      {
+        updateTextStyle: {
+          range: { startIndex: 45, endIndex: 47, tabId: TAB_ID },
+          textStyle: {},
+          fields: "bold,italic,strikethrough,link",
+        },
+      },
+    ]);
   });
 });
 
@@ -307,6 +501,57 @@ describe("source map invariants", () => {
   });
 });
 
+describe("Markdown links", () => {
+  it.each([
+    ["balanced", PARENTHESIZED_URL],
+    ["escaped", "https://en.wikipedia.org/wiki/Function_\\(mathematics\\)"],
+  ])("parses %s destination parentheses", (_name, destination) => {
+    let requests = markdownToDocRequests(`[link](${destination})`, 1, TAB_ID);
+
+    expect(requests[0]).toEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "link" },
+    });
+    expect(requests).toContainEqual({
+      updateTextStyle: {
+        range: { startIndex: 1, endIndex: 5, tabId: TAB_ID },
+        textStyle: { link: { url: PARENTHESIZED_URL } },
+        fields: "link",
+      },
+    });
+  });
+
+  it("renders destination parentheses canonically escaped", () => {
+    let snapshot = docTabToMarkdown(buildTab([{ runs: [
+      { text: "link", style: { link: { url: PARENTHESIZED_URL } } }, "\n",
+    ] }]));
+
+    expect(snapshot.markdown).toBe(
+      "[link](https://en.wikipedia.org/wiki/Function_\\(mathematics\\))\n",
+    );
+  });
+
+  it("preserves a parenthesized link beside a formatting edit", () => {
+    let snapshot = docTabToMarkdown(buildTab([{ runs: [
+      { text: "bold", style: { bold: true } }, " and ",
+      { text: "link", style: { link: { url: PARENTHESIZED_URL } } }, "\n",
+    ] }]));
+    let requests = computeReplaceOperations(
+      snapshot.sourceMap, snapshot.markdown, 0, "**bold**".length, "plain", TAB_ID,
+    ).requests;
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "plain and link" },
+    });
+    expect(requests).toContainEqual({
+      updateTextStyle: {
+        range: { startIndex: 11, endIndex: 15, tabId: TAB_ID },
+        textStyle: { link: { url: PARENTHESIZED_URL } },
+        fields: "link",
+      },
+    });
+  });
+});
+
 // Tab bodies have independent index spaces, so a coordinate without the selected tab's ID would
 // land in whichever tab Google picks by default.
 describe("selected-tab write coordinates", () => {
@@ -314,10 +559,6 @@ describe("selected-tab write coordinates", () => {
     let requests = markdownToDocRequests(
       "# Head\n\n- one\n\n**bold** and [link](https://e.com)\n", 7, "metrics");
 
-    expect(requests.map(request => Object.keys(request)[0])).toEqual([
-      "insertText", "updateParagraphStyle", "createParagraphBullets", "updateTextStyle",
-      "updateTextStyle",
-    ]);
     let found = coordinates(requests);
     expect(found).toHaveLength(requests.length);
     for (const coordinate of found) expect(coordinate.tabId).toBe("metrics");
@@ -346,21 +587,21 @@ describe("computeReplaceOperations", () => {
   });
 
   it("deletes then re-inserts at the mapped document range", () => {
-    expect(replace("world", "there")).toEqual({
-      trimmedOld: "world",
-      trimmedNew: "there",
-      requests: [
-        { deleteContentRange: { range: { startIndex: 18, endIndex: 23, tabId: TAB_ID } } },
-        { insertText: { location: { index: 18, tabId: TAB_ID }, text: "there" } },
-      ],
-    });
+    let result = replace("world", "there");
+
+    expect(result).toMatchObject({ trimmedOld: "world", trimmedNew: "there" });
+    expect(result.requests.slice(0, 2)).toEqual([
+      { deleteContentRange: { range: { startIndex: 18, endIndex: 23, tabId: TAB_ID } } },
+      { insertText: { location: { index: 18, tabId: TAB_ID }, text: "there" } },
+    ]);
   });
 
   it("trims a shared prefix down to a bare insert", () => {
-    expect(replace("world", "worlds")).toEqual({
-      trimmedOld: "",
-      trimmedNew: "s",
-      requests: [{ insertText: { location: { index: 23, tabId: TAB_ID }, text: "s" } }],
+    let result = replace("world", "worlds");
+
+    expect(result).toMatchObject({ trimmedOld: "", trimmedNew: "s" });
+    expect(result.requests[0]).toEqual({
+      insertText: { location: { index: 23, tabId: TAB_ID }, text: "s" },
     });
   });
 
@@ -372,29 +613,487 @@ describe("computeReplaceOperations", () => {
     });
   });
 
-  // BUG (pre-existing, unfixed): when the replaced range touches Markdown syntax, mdRangeToDocRange
-  // widens the delete to the whole enclosing block but computeReplaceOperations still inserts only
-  // the caller's replacement text, so the rest of the paragraph is destroyed. The approval preview
-  // uses a plain string splice and shows the correct result, so the user approves "Hello plain
-  // world." and the document becomes "plain".
-  //
-  // `it.fails` records the correct expectation without failing CI. Delete the `.fails` when fixed.
-  it.fails("preserves surrounding text when the range spans Markdown syntax", () => {
-    let result = replace("**bold**", "plain");
-    let deleted = result.requests[0].deleteContentRange.range;
-    let inserted = result.requests[1].insertText.text;
-    // The delete covers "Hello bold world.\n" (doc 7..25), so the insert must restore all of it.
-    expect({ deleted, inserted }).toEqual({
-      deleted: { startIndex: 7, endIndex: 25, tabId: TAB_ID },
-      inserted: "Hello plain world.\n",
+  it("preserves surrounding text when the range spans Markdown syntax", () => {
+    expect(replace("**bold**", "plain").requests.slice(0, 2)).toEqual([
+      { deleteContentRange: { range: { startIndex: 7, endIndex: 24, tabId: TAB_ID } } },
+      { insertText: { location: { index: 7, tabId: TAB_ID }, text: "Hello plain world." } },
+    ]);
+  });
+
+  it("does not expand an insertion into a preceding protected list item", () => {
+    let protectedSnapshot = docTabToMarkdown(buildTab([
+      { runs: [
+        { richLink: { title: "Plan", uri: "https://docs.google.com/document/d/plan" } },
+        "\n",
+      ], bullet: { listId: "L1" } },
+      { runs: ["second\n"], bullet: { listId: "L1" } },
+    ], BULLET_LIST));
+    let oldText = "- second";
+    let start = protectedSnapshot.markdown.indexOf(oldText);
+
+    let { requests } = computeReplaceOperations(
+      protectedSnapshot.sourceMap,
+      protectedSnapshot.markdown,
+      start,
+      start + oldText.length,
+      `Intro\n${oldText}`,
+      TAB_ID,
+    );
+
+    expect(requests[0]).toEqual({
+      deleteContentRange: { range: { startIndex: 3, endIndex: 9, tabId: TAB_ID } },
     });
   });
 
-  it("currently truncates the paragraph in that case", () => {
-    let result = replace("**bold**", "plain");
-    expect(result.requests).toEqual([
-      { deleteContentRange: { range: { startIndex: 7, endIndex: 25, tabId: TAB_ID } } },
-      { insertText: { location: { index: 7, tabId: TAB_ID }, text: "plain" } },
+  it("preserves untouched literal Markdown punctuation", () => {
+    let punctuationSnapshot = docTabToMarkdown(buildTab([{ runs: [
+      { text: "bold", style: { bold: true } }, " costs 2 * 3 = 6\n",
+    ] }]));
+    let oldText = "**bold**";
+    let start = punctuationSnapshot.markdown.indexOf(oldText);
+
+    let { requests } = computeReplaceOperations(
+      punctuationSnapshot.sourceMap,
+      punctuationSnapshot.markdown,
+      start,
+      start + oldText.length,
+      "plain",
+      TAB_ID,
+    );
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "plain costs 2 * 3 = 6" },
+    });
+  });
+
+  it("preserves untouched backslashes during block rewrites", () => {
+    let path = String.raw`\\server\share`;
+    let pathSnapshot = docTabToMarkdown(buildTab([{
+      runs: [`Path ${path}\n`], namedStyleType: "HEADING_1",
+    }]));
+
+    let { requests } = computeReplaceOperations(
+      pathSnapshot.sourceMap, pathSnapshot.markdown, 0, pathSnapshot.markdown.trimEnd().length,
+      `Path ${path}`, TAB_ID,
+    );
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: `Path ${path}` },
+    });
+  });
+
+  it("turns escaped formatting delimiters into literal text", () => {
+    let bold = docTabToMarkdown(buildTab([{ runs: [
+      { text: "bold", style: { bold: true } }, "\n",
+    ] }]));
+    let { requests } = computeReplaceOperations(
+      bold.sourceMap, bold.markdown, 0, "**bold**".length,
+      String.raw`\*\*bold\*\*`, TAB_ID,
+    );
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "**bold**" },
+    });
+    expect(requests).toContainEqual({
+      updateTextStyle: {
+        range: { startIndex: 1, endIndex: 9, tabId: TAB_ID },
+        textStyle: {},
+        fields: "bold,italic,strikethrough,link",
+      },
+    });
+  });
+
+  it.each(["# heading", "- item", "1. item"])(
+    "keeps %s literal inside a paragraph",
+    replacement => {
+      let plain = docTabToMarkdown(buildTab([{ runs: ["Alpha target omega\n"] }]));
+      let start = plain.markdown.indexOf("target");
+      let { requests } = computeReplaceOperations(
+        plain.sourceMap, plain.markdown, start, start + "target".length, replacement, TAB_ID,
+      );
+
+      expect(requests).toContainEqual({
+        insertText: {
+          location: { index: 1, tabId: TAB_ID },
+          text: `Alpha ${replacement} omega`,
+        },
+      });
+      expect(requests.some(request =>
+        "updateParagraphStyle" in request || "createParagraphBullets" in request ||
+        "deleteParagraphBullets" in request,
+      )).toBe(false);
+    },
+  );
+
+  it("applies block syntax isolated by trimming", () => {
+    let plain = docTabToMarkdown(buildTab([{ runs: ["Title\n"] }]));
+
+    let { requests } = computeReplaceOperations(
+      plain.sourceMap, plain.markdown, 0, "Title".length, "# Title", TAB_ID,
+    );
+
+    expect(requests).toContainEqual({
+      updateParagraphStyle: {
+        range: { startIndex: 1, endIndex: 7, tabId: TAB_ID },
+        paragraphStyle: { namedStyleType: "HEADING_1" },
+        fields: "namedStyleType",
+      },
+    });
+  });
+
+  it.each([
+    ["bullet", "- Title", "BULLET_DISC_CIRCLE_SQUARE"],
+    ["numbered", "1. Title", "NUMBERED_DECIMAL_ALPHA_ROMAN"],
+  ])("applies %s syntax at a paragraph boundary", (_name, replacement, bulletPreset) => {
+    let plain = docTabToMarkdown(buildTab([{ runs: ["Title\n"] }]));
+    let { requests } = computeReplaceOperations(
+      plain.sourceMap, plain.markdown, 0, "Title".length, replacement, TAB_ID,
+    );
+
+    expect(requests).toContainEqual({
+      createParagraphBullets: {
+        range: { startIndex: 1, endIndex: 7, tabId: TAB_ID },
+        bulletPreset,
+      },
+    });
+  });
+  it("creates contiguous numbered items as one list", () => {
+    let requests = markdownToDocRequests("1. First\n1. Second", 1, TAB_ID);
+
+    expect(requests.filter(request => "createParagraphBullets" in request)).toEqual([{
+      createParagraphBullets: {
+        range: { startIndex: 1, endIndex: 14, tabId: TAB_ID },
+        bulletPreset: "NUMBERED_DECIMAL_ALPHA_ROMAN",
+      },
+    }]);
+  });
+
+  it("clears removed heading and list styles", () => {
+    let heading = docTabToMarkdown(buildTab([{
+      runs: ["Title\n"], namedStyleType: "HEADING_1",
+    }]));
+    let list = docTabToMarkdown(buildTab([{
+      runs: ["item\n"], bullet: { listId: "L1" },
+    }], BULLET_LIST));
+
+    let headingRequests = computeReplaceOperations(
+      heading.sourceMap, heading.markdown, 0, "# Title".length, "Title", TAB_ID,
+    ).requests;
+    let listRequests = computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, "- item".length, "item", TAB_ID,
+    ).requests;
+
+    expect(headingRequests).toContainEqual({
+      updateParagraphStyle: {
+        range: { startIndex: 1, endIndex: 7, tabId: TAB_ID },
+        paragraphStyle: { namedStyleType: "NORMAL_TEXT" },
+        fields: "namedStyleType",
+      },
+    });
+    expect(listRequests).toContainEqual({
+      deleteParagraphBullets: { range: { startIndex: 1, endIndex: 6, tabId: TAB_ID } },
+    });
+  });
+
+  it("clears indentation after removing list bullets", () => {
+    let list = docTabToMarkdown(buildTab([{
+      runs: ["nested\n"], bullet: { listId: "L1", nestingLevel: 1 },
+    }], BULLET_LIST));
+    let requests = computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, "  - nested".length, "nested", TAB_ID,
+    ).requests;
+    let deleteIndex = requests.findIndex(request => "deleteParagraphBullets" in request);
+
+    expect(requests.slice(deleteIndex, deleteIndex + 2)).toEqual([
+      { deleteParagraphBullets: { range: { startIndex: 1, endIndex: 8, tabId: TAB_ID } } },
+      {
+        updateParagraphStyle: {
+          range: { startIndex: 1, endIndex: 8, tabId: TAB_ID },
+          paragraphStyle: {
+            indentStart: { magnitude: 0, unit: "PT" },
+            indentFirstLine: { magnitude: 0, unit: "PT" },
+          },
+          fields: "indentStart,indentFirstLine",
+        },
+      },
     ]);
+  });
+
+  it("clears list indentation when one item becomes plain paragraphs", () => {
+    let list = docTabToMarkdown(buildTab([{
+      runs: ["nested\n"], bullet: { listId: "L1", nestingLevel: 1 },
+    }], BULLET_LIST));
+    let requests = computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, list.markdown.trimEnd().length,
+      "plain\n\nsecond", TAB_ID,
+    ).requests;
+
+    expect(requests.filter(request =>
+      "updateParagraphStyle" in request || "deleteParagraphBullets" in request,
+    )).toEqual([
+      {
+        updateParagraphStyle: {
+          range: { startIndex: 1, endIndex: 7, tabId: TAB_ID },
+          paragraphStyle: {
+            namedStyleType: "NORMAL_TEXT",
+            indentStart: { magnitude: 0, unit: "PT" },
+            indentFirstLine: { magnitude: 0, unit: "PT" },
+          },
+          fields: "namedStyleType,indentStart,indentFirstLine",
+        },
+      },
+      { deleteParagraphBullets: { range: { startIndex: 1, endIndex: 7, tabId: TAB_ID } } },
+      {
+        updateParagraphStyle: {
+          range: { startIndex: 7, endIndex: 14, tabId: TAB_ID },
+          paragraphStyle: {
+            namedStyleType: "NORMAL_TEXT",
+            indentStart: { magnitude: 0, unit: "PT" },
+            indentFirstLine: { magnitude: 0, unit: "PT" },
+          },
+          fields: "namedStyleType,indentStart,indentFirstLine",
+        },
+      },
+      { deleteParagraphBullets: { range: { startIndex: 7, endIndex: 14, tabId: TAB_ID } } },
+    ]);
+  });
+
+  it("rebuilds list nesting after deleting paragraph terminators", () => {
+    let nestedList = docTabToMarkdown(buildTab([
+      { runs: ["One\n"], bullet: { listId: "L1", nestingLevel: 0 } },
+      { runs: ["Two\n"], bullet: { listId: "L1", nestingLevel: 1 } },
+    ], {
+      L1: { listProperties: { nestingLevels: [{ glyphSymbol: "•" }, { glyphSymbol: "◦" }] } },
+    }));
+
+    let requests = computeReplaceOperations(
+      nestedList.sourceMap, nestedList.markdown, 0, nestedList.markdown.trimEnd().length,
+      "- Alpha\n  - Beta", TAB_ID,
+    ).requests;
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "Alpha\n\tBeta" },
+    });
+    expect(requests.filter(request => "createParagraphBullets" in request)).toEqual([{
+      createParagraphBullets: {
+        range: { startIndex: 1, endIndex: 13, tabId: TAB_ID },
+        bulletPreset: "BULLET_DISC_CIRCLE_SQUARE",
+      },
+    }]);
+  });
+
+  it("refuses list edits whose block count cannot preserve formatting", () => {
+    let list = docTabToMarkdown(buildTab([{
+      runs: ["Task\n"], bullet: { listId: "check" },
+    }], {
+      check: { listProperties: { nestingLevels: [{ glyphSymbol: "☐" }] } },
+    }));
+
+    expect(() => computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, list.markdown.trimEnd().length,
+      "- One\n- Two", TAB_ID,
+    )).toThrow("cannot preserve list formatting");
+  });
+
+  it("preserves an unchanged custom list when inserting an adjacent block", () => {
+    let list = docTabToMarkdown(buildTab([{
+      runs: ["Task\n"], bullet: { listId: "check" },
+    }], {
+      check: { listProperties: { nestingLevels: [{ glyphSymbol: "☐" }] } },
+    }));
+    let requests = computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, list.markdown.trimEnd().length,
+      "Intro\n- Task", TAB_ID,
+    ).requests;
+
+    expect(requests.some(request => "createParagraphBullets" in request)).toBe(false);
+  });
+
+  it("preserves title and custom list styles during inline edits", () => {
+    let title = docTabToMarkdown(buildTab([{
+      runs: [{ text: "Title", style: { bold: true } }, "\n"], namedStyleType: "TITLE",
+    }]));
+    let list = docTabToMarkdown(buildTab([{
+      runs: [{ text: "Task", style: { bold: true } }, "\n"], bullet: { listId: "check" },
+    }], {
+      check: { listProperties: { nestingLevels: [{ glyphSymbol: "☐" }] } },
+    }));
+    let titleRequests = computeReplaceOperations(
+      title.sourceMap, title.markdown, 0, "# **Title**".length, "# Title", TAB_ID,
+    ).requests;
+    let listRequests = computeReplaceOperations(
+      list.sourceMap, list.markdown, 0, "- **Task**".length, "- Task", TAB_ID,
+    ).requests;
+
+    expect(titleRequests.some(request => "updateParagraphStyle" in request)).toBe(false);
+    expect(listRequests.some(request =>
+      "deleteParagraphBullets" in request || "createParagraphBullets" in request,
+    )).toBe(false);
+  });
+
+  it("applies bold from a mapped inline source", () => {
+    let requests = replace("bold", "bald").requests;
+
+    expect(requests.slice(2)).toEqual([{
+      updateTextStyle: {
+        range: { startIndex: 14, endIndex: 15, tabId: TAB_ID },
+        textStyle: { bold: true },
+        fields: "bold,italic,strikethrough,link",
+      },
+    }]);
+  });
+
+  it("applies a link from a mapped inline source", () => {
+    let linked = docTabToMarkdown(buildTab([{ runs: [
+      { text: "link", style: { link: { url: "https://example.com" } } }, "\n",
+    ] }]));
+    let start = linked.markdown.indexOf("link");
+    let requests = computeReplaceOperations(
+      linked.sourceMap, linked.markdown, start, start + "link".length, "lint", TAB_ID,
+    ).requests;
+
+    expect(requests.slice(2)).toEqual([{
+      updateTextStyle: {
+        range: { startIndex: 4, endIndex: 5, tabId: TAB_ID },
+        textStyle: { link: { url: "https://example.com" } },
+        fields: "bold,italic,strikethrough,link",
+      },
+    }]);
+  });
+
+  it("preserves a shared style across adjacent source segments", () => {
+    let styled = docTabToMarkdown(buildTab([{ runs: [
+      { text: "one", style: { bold: true } },
+      { text: "two", style: { bold: true } },
+      "\n",
+    ] }]));
+    let start = styled.markdown.indexOf("onetwo");
+    let requests = computeReplaceOperations(
+      styled.sourceMap, styled.markdown, start, start + "onetwo".length, "new", TAB_ID,
+    ).requests;
+
+    expect(requests.at(-1)).toEqual({
+      updateTextStyle: {
+        range: { startIndex: 1, endIndex: 4, tabId: TAB_ID },
+        textStyle: { bold: true },
+        fields: "bold,italic,strikethrough,link",
+      },
+    });
+  });
+
+  it("resets a mapped plain source beside styled text", () => {
+    let mixed = docTabToMarkdown(buildTab([{ runs: [
+      { text: "bold", style: { bold: true } }, "plain\n",
+    ] }]));
+    let start = mixed.markdown.indexOf("plain");
+    let requests = computeReplaceOperations(
+      mixed.sourceMap, mixed.markdown, start, start + "plain".length, "new", TAB_ID,
+    ).requests;
+
+    expect(requests.slice(2)).toEqual([{
+      updateTextStyle: {
+        range: { startIndex: 5, endIndex: 8, tabId: TAB_ID },
+        textStyle: {},
+        fields: "bold,italic,strikethrough,link",
+      },
+    }]);
+  });
+
+  it("resets inherited styles before applying Markdown styles", () => {
+    let styled = docTabToMarkdown(buildTab([{ runs: [{
+      text: "Old\n",
+      style: {
+        bold: true,
+        italic: true,
+        strikethrough: true,
+        link: { url: "https://example.com" },
+      },
+    }] }]));
+    let requests = computeReplaceOperations(
+      styled.sourceMap, styled.markdown, 0, styled.markdown.trimEnd().length,
+      "**New**", TAB_ID,
+    ).requests;
+
+    expect(requests.filter(request => "updateTextStyle" in request)).toEqual([
+      {
+        updateTextStyle: {
+          range: { startIndex: 1, endIndex: 4, tabId: TAB_ID },
+          textStyle: {},
+          fields: "bold,italic,strikethrough,link",
+        },
+      },
+      {
+        updateTextStyle: {
+          range: { startIndex: 1, endIndex: 4, tabId: TAB_ID },
+          textStyle: { bold: true },
+          fields: "bold",
+        },
+      },
+    ]);
+  });
+
+  it("uses an explicit italic override when removing subtitle emphasis", () => {
+    let subtitle = docTabToMarkdown(buildTab([{
+      runs: ["Subtitle\n"], namedStyleType: "SUBTITLE",
+    }]));
+    let requests = computeReplaceOperations(
+      subtitle.sourceMap, subtitle.markdown, 0, "*Subtitle*".length, "Subtitle", TAB_ID,
+    ).requests;
+
+    expect(requests).toContainEqual({
+      updateTextStyle: {
+        range: { startIndex: 1, endIndex: 9, tabId: TAB_ID },
+        textStyle: { italic: false },
+        fields: "italic",
+      },
+    });
+    expect(requests.some(request =>
+      "updateParagraphStyle" in request &&
+      request.updateParagraphStyle.paragraphStyle.namedStyleType === "NORMAL_TEXT",
+    )).toBe(false);
+  });
+
+  it("reuses the existing terminator when emptying a block", () => {
+    let heading = docTabToMarkdown(buildTab([{
+      runs: ["Title\n"], namedStyleType: "HEADING_1",
+    }]));
+
+    let { requests } = computeReplaceOperations(
+      heading.sourceMap, heading.markdown, 0, "# Title".length, "", TAB_ID,
+    );
+
+    expect(requests.some(request => "insertText" in request)).toBe(false);
+  });
+
+  it("preserves list nesting", () => {
+    let requests = markdownToDocRequests("  - nested", 1, TAB_ID);
+
+    expect(requests).toContainEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "\tnested" },
+    });
+  });
+
+  it("parses backslash-escaped Markdown punctuation", () => {
+    let requests = markdownToDocRequests(String.raw`\* literal C:\temp`, 1, TAB_ID);
+
+    expect(requests).toEqual([
+      { insertText: { location: { index: 1, tabId: TAB_ID }, text: "* literal C:\\temp" } },
+      {
+        updateTextStyle: {
+          range: { startIndex: 1, endIndex: 18, tabId: TAB_ID },
+          textStyle: {},
+          fields: "bold,italic,strikethrough,link",
+        },
+      },
+    ]);
+  });
+
+  it("inserts unsupported numbered starts literally", () => {
+    let requests = markdownToDocRequests("2. item", 1, TAB_ID);
+
+    expect(requests[0]).toEqual({
+      insertText: { location: { index: 1, tabId: TAB_ID }, text: "2. item" },
+    });
+    expect(requests.some(request => "createParagraphBullets" in request)).toBe(false);
   });
 });

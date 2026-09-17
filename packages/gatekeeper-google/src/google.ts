@@ -17,7 +17,8 @@ import type {
   SpreadsheetValueMode,
 } from "./sheets-types";
 import {
-  assertMarkdownRangeEditable, computeReplaceOperations, docTabToMarkdown, markdownToDocRequests,
+  assertMarkdownRangeEditable, canonicalizeMarkdownEscapes, canonicalizeMarkdownReplacement,
+  computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
   type DocTabSnapshot, type MarkdownRange,
 } from "./markdown-converter";
 import { DriveApi, DriveApiRequestError } from "./drive-api";
@@ -1132,8 +1133,8 @@ const DOC_METADATA_REVISION_KEY = "docMetadataRevision";
 const DOC_SNAPSHOT_TTL_MS = 10_000;
 /** The last document read. Pending actions overlay it, so it outlives none. */
 const DOC_SNAPSHOT_KEY = "docSnapshot";
-/** Rendering schema stored under {@link DOC_SNAPSHOT_KEY}; bump whenever cached output changes. */
-const DOC_SNAPSHOT_FORMAT_VERSION = 6;
+/** Rendering schema stored under {@link DOC_SNAPSHOT_KEY}; bumped by the converter it comes from. */
+const DOC_SNAPSHOT_FORMAT_VERSION = MARKDOWN_RENDERING_VERSION;
 /** Name prefix of the named range that marks one Gadgets write. Permanent: retries match on it. */
 const WRITE_MARKER_PREFIX = "gadgets-write-";
 
@@ -1227,14 +1228,11 @@ function googleDocSnapshot(document: GoogleDocsDocument): GoogleDocSnapshot {
 
 /** Accept a cached snapshot only if it predates nothing this code depends on. */
 function isGoogleDocSnapshot(value: unknown): value is GoogleDocSnapshot {
-  if (!value || typeof value !== "object" ||
-      !("formatVersion" in value) || !("title" in value) || !("tabs" in value) ||
-      !("fetchedAt" in value)) return false;
-  let revisionId = "revisionId" in value ? value.revisionId : undefined;
-  return value.formatVersion === DOC_SNAPSHOT_FORMAT_VERSION && typeof value.title === "string" &&
-      Array.isArray(value.tabs) &&
-      (revisionId === undefined || typeof revisionId === "string") &&
-      typeof value.fetchedAt === "number" && Number.isFinite(value.fetchedAt);
+  if (!value || typeof value !== "object") return false;
+  let {formatVersion, title, tabs, revisionId, fetchedAt} = value as Partial<GoogleDocSnapshot>;
+  return formatVersion === DOC_SNAPSHOT_FORMAT_VERSION && typeof title === "string" &&
+      Array.isArray(tabs) && (revisionId === undefined || typeof revisionId === "string") &&
+      typeof fetchedAt === "number" && Number.isFinite(fetchedAt);
 }
 
 /**
@@ -1378,7 +1376,8 @@ function applyMarkdownReplacement(
   action: GoogleDocReplaceAction,
   tabId: string,
 ): GoogleDocSimulatedContent {
-  let { oldMarkdown, newMarkdown } = action;
+  let oldMarkdown = action.oldMarkdown;
+  let newMarkdown = canonicalizeMarkdownReplacement(oldMarkdown, action.newMarkdown);
   if (oldMarkdown === newMarkdown) return content;
 
   let start = findUniqueMarkdown(content.markdown, oldMarkdown, "replaceText", tabId);
@@ -1387,10 +1386,11 @@ function applyMarkdownReplacement(
   let offset = newMarkdown.length - oldMarkdown.length;
   return {
     markdown: content.markdown.slice(0, start) + newMarkdown + content.markdown.slice(end),
-    protectedRanges: content.protectedRanges.map(range => range.mdEnd <= start ? range : {
-      mdStart: range.mdStart + offset,
-      mdEnd: range.mdEnd + offset,
-    }),
+    protectedRanges: offset === 0 ? content.protectedRanges
+      : content.protectedRanges.map(range => range.mdEnd <= start ? range : {
+        mdStart: range.mdStart + offset,
+        mdEnd: range.mdEnd + offset,
+      }),
   };
 }
 
@@ -1425,7 +1425,9 @@ function applyGoogleDocActionToContent(
     case "appendText":
       return {
         ...content,
-        markdown: appendMarkdownForSimulation(content.markdown, action.markdown),
+        markdown: appendMarkdownForSimulation(
+          content.markdown, canonicalizeMarkdownEscapes(action.markdown),
+        ),
       };
     default:
       action satisfies never;
@@ -1533,13 +1535,14 @@ function materializeGoogleDocAction(
 
   switch (action.type) {
     case "replaceText": {
+      let oldMarkdown = action.oldMarkdown;
       let matchStart = findUniqueMarkdown(
-          tab.markdown, action.oldMarkdown, "applyAction(replaceText)", tab.tabId);
+          tab.markdown, oldMarkdown, "applyAction(replaceText)", tab.tabId);
       let { requests } = computeReplaceOperations(
           tab.sourceMap,
           tab.markdown,
           matchStart,
-          matchStart + action.oldMarkdown.length,
+          matchStart + oldMarkdown.length,
           action.newMarkdown,
           tab.tabId);
       return { tab, requests };
