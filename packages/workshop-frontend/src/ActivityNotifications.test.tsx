@@ -48,16 +48,34 @@ async function renderPending(restricted?: boolean): Promise<HTMLElement> {
   return description
 }
 
+// The text a screen reader announces as the Approve button's description.
+function approveDescribedBy(): string | null {
+  const approve = [...document.querySelectorAll('button')].find(b => b.textContent === 'Approve')
+  if (!approve) throw new Error('No Approve button rendered')
+  const ids = approve.getAttribute('aria-describedby')
+  if (ids === null) return null
+  return ids.split(' ').map(id => {
+    const el = document.getElementById(id)
+    if (!el) throw new Error(`aria-describedby names a missing element: ${id}`)
+    return el.textContent ?? ''
+  }).join('\n')
+}
+
 describe('ActivityNotifications', () => {
   it('shows the review notice and the untruncated request while restricted', async () => {
     const description = await renderPending(true)
     expect(document.body.textContent).toContain(RESTRICTED_APPROVAL_COPY)
     expect(description.classList.contains('line-clamp-2')).toBe(false)
+    // The controls precede the review text in DOM order, so the buttons name it explicitly.
+    const described = approveDescribedBy()
+    expect(described).toContain(RESTRICTED_APPROVAL_COPY)
+    expect(described).toContain('Regards, the workspace.')
   })
 
   it('clamps the request and shows no notice when not restricted', async () => {
     const description = await renderPending()
     expect(document.body.textContent).not.toContain(RESTRICTED_APPROVAL_COPY)
     expect(description.classList.contains('line-clamp-2')).toBe(true)
+    expect(approveDescribedBy()).toBeNull()
   })
 })
