@@ -1432,6 +1432,7 @@ const ToolCallDetails = memo(function ToolCallDetails(
               </pre>
             </>
           )}
+          {!!tc.attachments?.length && <ChatAttachmentGrid attachments={tc.attachments} />}
         </>
       ) : (
         <pre className="max-h-56 overflow-auto rounded-xl border border-kumo-line/70 bg-kumo-base p-3 font-mono text-[12px] leading-[18px] text-kumo-subtle whitespace-pre-wrap">
