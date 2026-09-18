@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Message } from "@earendil-works/pi-ai";
 import {
-  codeModeImageContent, decodeCodeModeImages, MAX_MODEL_IMAGE_BYTES, pruneImageInput,
+  codeModeImageContent, decodeCodeModeImages, MAX_CODE_IMAGE_BYTES, pruneImageInput,
 } from "../src/code-mode-output.js";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -30,17 +30,19 @@ describe("returned code images", () => {
     expect(result.notes).toEqual([expect.stringMatching(/^\[Image 1 omitted: .{1,100}\]$/)]);
   });
 
-  it("admits the exact byte limit and rejects one byte beyond it", () => {
-    let bytes = new Uint8Array(15 * 1024 * 1024);
+  it("admits the exact byte limit, and tells the model how to recover one byte beyond it", () => {
+    let bytes = new Uint8Array(MAX_CODE_IMAGE_BYTES);
     bytes.set([0x89, 0x50, 0x4e, 0x47]);
     expect(decodeCodeModeImages([{...IMAGE, data: bytes.toBase64()}]).images).toHaveLength(1);
     let tooMany = new Uint8Array(bytes.length + 1);
     tooMany.set(bytes);
-    expect(decodeCodeModeImages([{...IMAGE, data: tooMany.toBase64()}]).images).toHaveLength(0);
+    expect(decodeCodeModeImages([{...IMAGE, data: tooMany.toBase64()}])).toEqual({
+      images: [], notes: [expect.stringMatching(/limited to 5 MiB per execution; ask for a smaller/)],
+    });
   });
 
-  it("bounds all returned images together to 15 MiB", () => {
-    let bytes = new Uint8Array(8 * 1024 * 1024);
+  it("bounds all returned images together", () => {
+    let bytes = new Uint8Array(3 * 1024 * 1024);
     bytes.set([0x89, 0x50, 0x4e, 0x47]);
     let image = {...IMAGE, data: bytes.toBase64()};
     let result = decodeCodeModeImages([image, image, IMAGE]);
@@ -83,14 +85,6 @@ describe("image replay", () => {
     expect(load).not.toHaveBeenCalled();
   });
 
-  it("withholds an image too large for model input without reading it from storage", async () => {
-    let load = vi.fn(async () => Uint8Array.fromBase64(PNG));
-    let result = await codeModeImageContent(
-        [{...attachment, size: MAX_MODEL_IMAGE_BYTES + 1}], true, load);
-    expect(result).toEqual([{type: "text", text: expect.stringContaining("too large for model input")}]);
-    expect(load).not.toHaveBeenCalled();
-  });
-
   it("reports unavailable evidence without fabricating replacement image data", async () => {
     let result = await codeModeImageContent([attachment], true, async () => {
       throw new Error("Missing content.");
@@ -109,7 +103,7 @@ describe("model image budget", () => {
     typeof message.content === "string" ? [] : message.content.map(part => part.type));
 
   it("leaves a request within the budget untouched", () => {
-    let messages = [toolResult(image(3 * MIB)), toolResult(image(3 * MIB))];
+    let messages = [toolResult(image(1.5 * MIB)), toolResult(image(1.5 * MIB), image(1.5 * MIB))];
     let before = structuredClone(messages);
     pruneImageInput(messages);
     expect(messages).toEqual(before);
@@ -117,25 +111,24 @@ describe("model image budget", () => {
 
   it("keeps the newest images and marks the ones that no longer fit", () => {
     let messages: Message[] = [
-      toolResult(image(3 * MIB)),
-      {role: "user", content: [{type: "text", text: "Look."}, image(3 * MIB)], timestamp: 0},
-      toolResult({type: "text", text: "Captured."}, image(3 * MIB)),
+      toolResult(image(1.5 * MIB)),
+      {role: "user", content: [{type: "text", text: "Look."}, image(1.5 * MIB)], timestamp: 0},
+      toolResult({type: "text", text: "Captured."}, image(1.5 * MIB), image(1.5 * MIB)),
     ];
     pruneImageInput(messages);
-    expect(kinds(messages)).toEqual([["text"], ["text", "image"], ["text", "image"]]);
+    expect(kinds(messages)).toEqual([["text"], ["text", "image"], ["text", "image", "image"]]);
     expect(messages[0].content[0]).toEqual(
-        {type: "text", text: expect.stringContaining("no longer shown")});
+        {type: "text", text: "[image/png no longer shown: model input keeps the newest 5 MiB of images.]"});
   });
 
-  it("tells the model how to recover from an image no request can carry", () => {
-    let messages = [toolResult(image(3 * MIB)), toolResult(image(9 * MIB))];
+  it("never sends an image larger than the whole budget, and keeps older ones that fit", () => {
+    let messages = [toolResult(image(1.5 * MIB)), toolResult(image(6 * MIB))];
     pruneImageInput(messages);
     expect(kinds(messages)).toEqual([["image"], ["text"]]);
-    expect(messages[1].content[0]).toEqual(
-        {type: "text", text: expect.stringMatching(/9\.0 MiB is too large.*under 7\.0 MiB/)});
   });
 
-  it("stays under the inline limits Anthropic and Gemini document", () => {
-    expect(Math.ceil(MAX_MODEL_IMAGE_BYTES / 3) * 4).toBeLessThan(10_000_000);
+  it("fits the smallest documented limits with room for the conversation's text", () => {
+    // Anthropic: 10 MB of base64 per image. AI Gateway: no log, so no measured cost, over 10 MB.
+    expect(Math.ceil(MAX_CODE_IMAGE_BYTES / 3) * 4).toBeLessThan(7_500_000);
   });
 });

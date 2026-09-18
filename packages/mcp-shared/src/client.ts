@@ -483,9 +483,9 @@ export class McpClient {
     const sessionId = response.headers.get("Mcp-Session-Id");
     if (sessionId) this.sessionId = sessionId;
 
-    // A 15 MiB image occupies 20 MiB in base64; leave room for JSON/SSE framing.
-    // Discovery and OAuth retain their smaller budget.
-    const maxBytes = method === "tools/call" ? 21 * 1024 * 1024 : MAX_RESPONSE_BYTES;
+    // The Workshop accepts 5 MiB of images per execution, which is 6.7 MiB in base64; the rest
+    // is room for text and JSON/SSE framing. Discovery and OAuth retain their smaller budget.
+    const maxBytes = method === "tools/call" ? 8 * 1024 * 1024 : MAX_RESPONSE_BYTES;
     const contentType = (response.headers.get("Content-Type") ?? "").toLowerCase();
     let parsed: JsonRpcResponse;
     let responseBytes: number;

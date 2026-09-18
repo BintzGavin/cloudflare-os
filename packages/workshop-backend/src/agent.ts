@@ -1012,7 +1012,7 @@ NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` 
 let EXECUTE_CODE_TOOL_DESCRIPTION = `
 Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
 
-To see an image yourself and show it to the user, return an MCP-style result: \`return {content: [{type: "image", mimeType: "image/png", data: pngBase64}]};\`. A binding's result can be returned directly. PNG, JPEG, and WebP are supported, up to five images per execution. You see the most recent 7 MiB of images; a larger image is shown only to the user. Logging image data does not display an image.
+To see an image yourself and show it to the user, return an MCP-style result: \`return {content: [{type: "image", mimeType: "image/png", data: pngBase64}]};\`. A binding's result can be returned directly. PNG, JPEG, and WebP are supported, up to five images totaling 5 MiB per execution. You see the most recent 5 MiB of images. Logging image data does not display an image.
 
 The 'env' object contains this chat's named bindings:
 * An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to \`createGadget\`): an RPC stub pointing at the Gadget's server-side Durable Object. If the user asks you to interact with a Gadget directly, or asks if you can "see" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes).

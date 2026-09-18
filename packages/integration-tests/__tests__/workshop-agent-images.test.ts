@@ -120,7 +120,7 @@ it("carries a multi-chunk image through WorkerLoader, storage, and model replay"
   withAgent([
     {toolCall: {id: "large-image", name: "executeCode", arguments: {
       code: `export default async function() {
-        let bytes = new Uint8Array(6 * 1024 * 1024);
+        let bytes = new Uint8Array(4 * 1024 * 1024);
         bytes.set(Uint8Array.fromBase64("${PNG}"));
         bytes[bytes.length - 1] = 127;
         return {content: [{type: "image", mimeType: "image/png", data: bytes.toBase64()}]};
@@ -134,7 +134,7 @@ it("carries a multi-chunk image through WorkerLoader, storage, and model replay"
     const first = imageUrls(model.requests[1]);
     expect(first).toHaveLength(1);
     const bytes = Buffer.from(first[0].split(",")[1], "base64");
-    expect(bytes.length).toBe(6 * 1024 * 1024);
+    expect(bytes.length).toBe(4 * 1024 * 1024);
     expect(bytes[bytes.length - 1]).toBe(127);
     const calls = result.history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
     const call = calls.find(call => call.toolCallId === "large-image");
@@ -146,33 +146,59 @@ it("carries a multi-chunk image through WorkerLoader, storage, and model replay"
   }));
 
 // Anthropic rejects an inline image over 10 MB of base64, and Gemini a request over 20 MB. Stored
-// images replay into every later request, so sending one a provider rejects would fail them all.
-const rejectLargeImages: Handler = async (_url, method, _headers, request) => {
+// images replay into every later request, so sending what a provider rejects would fail them all.
+const strictProvider: Handler = async (_url, method, _headers, request) => {
   if (method !== "POST") return null;
   const urls = imageUrls(await request.clone().json());
-  return urls.some(url => url.length > 10_000_000)
-    ? new Response("image exceeds 10 MB maximum", {status: 400}) : null;
+  const total = urls.reduce((sum, url) => sum + url.length, 0);
+  return urls.some(url => url.length > 10_000_000) || total > 20_000_000
+    ? new Response("image or request exceeds the provider's maximum", {status: 400}) : null;
 };
 
-it("withholds an image too large for model input instead of failing every later request", () =>
+const returnImage = (mib: number, lastByte: number) => `export default async function() {
+  let bytes = new Uint8Array(${mib} * 1024 * 1024);
+  bytes.set(Uint8Array.fromBase64("${PNG}"));
+  bytes[bytes.length - 1] = ${lastByte};
+  return {content: [{type: "image", mimeType: "image/png", data: bytes.toBase64()}]};
+}`;
+const lastBytes = (request: unknown) =>
+  imageUrls(request).map(url => Buffer.from(url.split(",")[1], "base64").at(-1));
+
+it("rejects an image no model request could carry, and stores nothing", () =>
   withAgent([
-    {toolCall: {id: "huge-image", name: "executeCode", arguments: {
-      code: `export default async function() {
-        let bytes = new Uint8Array(15 * 1024 * 1024);
-        bytes.set(Uint8Array.fromBase64("${PNG}"));
-        return {content: [{type: "image", mimeType: "image/png", data: bytes.toBase64()}]};
-      }`,
-    }}},
-    {text: "I could not see that image."},
+    {toolCall: {id: "huge-image", name: "executeCode", arguments: {code: returnImage(15, 1)}}},
+    {text: "I will ask for a smaller image."},
     {text: "The conversation still works."},
   ], async (session, model) => {
     const result = await session.runTurn("Return an image larger than providers accept.");
     expect(result.outcome).toEqual({status: "completed"});
     expect(imageUrls(model.requests[1])).toEqual([]);
-    expect(JSON.stringify(model.requests[1])).toContain("too large for model input");
-    // The user can still open it: the image is stored like any other.
     const calls = result.history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
     const call = calls.find(call => call.toolCallId === "huge-image");
-    expect(call?.toolName === "executeCode" && call.attachments?.[0].size).toBe(15 * 1024 * 1024);
+    if (call?.toolName !== "executeCode") throw new Error("Missing image result.");
+    // The model learns the limit in the same step, and nothing it cannot see is stored.
+    expect(call.output).toContain("limited to 5 MiB per execution; ask for a smaller");
+    expect(call.attachments).toBeUndefined();
     expect((await session.runTurn("Continue.")).outcome).toEqual({status: "completed"});
-  }, [rejectLargeImages]));
+  }, [strictProvider]));
+
+it("keeps only the newest images in model input, in the live turn and on replay", () =>
+  withAgent([
+    {toolCall: {id: "first-image", name: "executeCode", arguments: {code: returnImage(3, 11)}}},
+    {toolCall: {id: "second-image", name: "executeCode", arguments: {code: returnImage(3, 22)}}},
+    {text: "Both captured."},
+    {text: "Only the newest image is still in view."},
+  ], async (session, model) => {
+    const result = await session.runTurn("Capture two large images in separate steps.");
+    expect(result.outcome).toEqual({status: "completed"});
+    expect(lastBytes(model.requests[1])).toEqual([11]);
+    // Together they exceed the budget: the older one leaves the live request...
+    expect(lastBytes(model.requests[2])).toEqual([22]);
+    expect(JSON.stringify(model.requests[2])).toContain("no longer shown");
+    // ...and the request rebuilt from stored history, while both stay previewable in the chat.
+    expect((await session.runTurn("What do you still see?")).outcome).toEqual({status: "completed"});
+    expect(lastBytes(model.requests[3])).toEqual([22]);
+    const calls = result.history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
+    expect(calls.flatMap(call => call.toolName === "executeCode" ? call.attachments ?? [] : [])
+        .map(attachment => attachment.size)).toEqual([3 * 1024 * 1024, 3 * 1024 * 1024]);
+  }, [strictProvider]));

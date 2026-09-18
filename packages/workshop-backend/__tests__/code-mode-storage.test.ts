@@ -92,9 +92,9 @@ it("sweeps abandoned images without deleting committed evidence", async () => {
 });
 
 
-it("persists a 15 MiB image across restart, fetches it on demand, and cleans up staged chunks", async () => {
+it("persists a 5 MiB image across restart, fetches it on demand, and cleans up staged chunks", async () => {
   let name = crypto.randomUUID();
-  let bytes = new Uint8Array(15 * 1024 * 1024);
+  let bytes = new Uint8Array(5 * 1024 * 1024);
   bytes.set(PNG);
   bytes[bytes.length - 1] = 127;
   let imageId = "";
