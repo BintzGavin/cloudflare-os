@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { codeModeImageContent, decodeCodeModeImages } from "../src/code-mode-output.js";
+import type { Message } from "@earendil-works/pi-ai";
+import {
+  codeModeImageContent, decodeCodeModeImages, MAX_MODEL_IMAGE_BYTES, pruneImageInput,
+} from "../src/code-mode-output.js";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 const IMAGE = {type: "image", mimeType: "image/png", data: PNG};
@@ -80,10 +83,59 @@ describe("image replay", () => {
     expect(load).not.toHaveBeenCalled();
   });
 
+  it("withholds an image too large for model input without reading it from storage", async () => {
+    let load = vi.fn(async () => Uint8Array.fromBase64(PNG));
+    let result = await codeModeImageContent(
+        [{...attachment, size: MAX_MODEL_IMAGE_BYTES + 1}], true, load);
+    expect(result).toEqual([{type: "text", text: expect.stringContaining("too large for model input")}]);
+    expect(load).not.toHaveBeenCalled();
+  });
+
   it("reports unavailable evidence without fabricating replacement image data", async () => {
     let result = await codeModeImageContent([attachment], true, async () => {
       throw new Error("Missing content.");
     });
     expect(result).toEqual([{type: "text", text: expect.stringContaining("not fetched again")}]);
+  });
+});
+
+describe("model image budget", () => {
+  const MIB = 1024 * 1024;
+  const image = (bytes: number) =>
+    ({type: "image" as const, mimeType: "image/png", data: "A".repeat(bytes / 3 * 4)});
+  const toolResult = (...content: Extract<Message, {role: "toolResult"}>["content"]): Message =>
+    ({role: "toolResult", toolCallId: "call", toolName: "executeCode", content, isError: false, timestamp: 0});
+  const kinds = (messages: Message[]) => messages.map(message =>
+    typeof message.content === "string" ? [] : message.content.map(part => part.type));
+
+  it("leaves a request within the budget untouched", () => {
+    let messages = [toolResult(image(3 * MIB)), toolResult(image(3 * MIB))];
+    let before = structuredClone(messages);
+    pruneImageInput(messages);
+    expect(messages).toEqual(before);
+  });
+
+  it("keeps the newest images and marks the ones that no longer fit", () => {
+    let messages: Message[] = [
+      toolResult(image(3 * MIB)),
+      {role: "user", content: [{type: "text", text: "Look."}, image(3 * MIB)], timestamp: 0},
+      toolResult({type: "text", text: "Captured."}, image(3 * MIB)),
+    ];
+    pruneImageInput(messages);
+    expect(kinds(messages)).toEqual([["text"], ["text", "image"], ["text", "image"]]);
+    expect(messages[0].content[0]).toEqual(
+        {type: "text", text: expect.stringContaining("no longer shown")});
+  });
+
+  it("tells the model how to recover from an image no request can carry", () => {
+    let messages = [toolResult(image(3 * MIB)), toolResult(image(9 * MIB))];
+    pruneImageInput(messages);
+    expect(kinds(messages)).toEqual([["image"], ["text"]]);
+    expect(messages[1].content[0]).toEqual(
+        {type: "text", text: expect.stringMatching(/9\.0 MiB is too large.*under 7\.0 MiB/)});
+  });
+
+  it("stays under the inline limits Anthropic and Gemini document", () => {
+    expect(Math.ceil(MAX_MODEL_IMAGE_BYTES / 3) * 4).toBeLessThan(10_000_000);
   });
 });
