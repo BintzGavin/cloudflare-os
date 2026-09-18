@@ -57,8 +57,10 @@ import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
+  MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENTS_PER_MESSAGE,
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
+import { decodeCodeModeOutput, type CodeModeOutput } from "./code-mode-output";
 import { renderGadgetInBrowser } from "./browser-export";
 import {
   defaultExportFormats,
@@ -97,6 +99,30 @@ export default class extends WorkerEntrypoint {
       }
     }
     let result = await agent(self, env, this.ctx);
+    if (Array.isArray(result?.content)) {
+      // Bound the explicit result before RPC. Image bytes must never enter tail logs.
+      let images = 0;
+      let remainingText = 65536;
+      let content = result.content.slice(0, 64).map(block => {
+        if (block?.type === "text" && typeof block.text === "string") {
+          let kept = block.text.slice(0, remainingText);
+          remainingText -= kept.length;
+          return {type: "text", text: kept +
+              (kept.length < block.text.length ? "\\n[Output text truncated.]" : "")};
+        }
+        if (block?.type === "image" && ++images <= ${MAX_CHAT_ATTACHMENTS_PER_MESSAGE} &&
+            typeof block.data === "string" &&
+            block.data.length <= ${Math.ceil(MAX_CHAT_ATTACHMENT_BYTES / 3) * 4} &&
+            typeof block.mimeType === "string" && block.mimeType.length <= 100) {
+          return {type: "image", data: block.data, mimeType: block.mimeType};
+        }
+        return {type: "text", text: "[Output omitted: unsupported content or image limit exceeded.]"};
+      });
+      if (result.content.length > 64) {
+        content.push({type: "text", text: "[Additional output content omitted.]"});
+      }
+      return {content, isError: result.isError === true};
+    }
     if (result !== undefined) console.log("Return value:", result);
   }
 }
@@ -169,7 +195,7 @@ let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
-  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<unknown>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -609,7 +635,6 @@ function validateBlueprintScreenshotUpload(screenshot: BlueprintScreenshotUpload
   return screenshot;
 }
 
-const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
 // Staged attachments (not associated with chat) older than this may be deleted when the gadget next stages an attachment.
 const MAX_STAGED_CHAT_ATTACHMENT_AGE_MS = 24 * 60 * 60 * 1000;
@@ -5682,16 +5707,21 @@ class OverseerImpl implements AgentHooks {
         else msg.pins = pins;
       }
     }
-    if (msg.type !== "message" || !msg.attachments?.length) return msg;
-    let attachments = msg.attachments.map((a) => {
+    if (msg.type !== "message") return msg;
+    let hydrate = (a: ChatAttachmentRef) => {
       if (!isAllowedChatAttachmentImageMimeType(a.mimeType)) {
         return a;
       }
       let content = this.storage.chatAttachmentContent.get(a.id);
-      if (!content) return a;
+      if (!content || content.state.type !== "committed" || content.state.chatId !== msg.chatId) return a;
       return {...a, content: content.data};
-    });
-    return {...msg, attachments};
+    };
+    return {...msg,
+      ...(msg.attachments && {attachments: msg.attachments.map(hydrate)}),
+      ...(msg.toolCalls && {toolCalls: msg.toolCalls.map(call =>
+        call.toolName === "executeCode" && call.attachments
+          ? {...call, attachments: call.attachments.map(hydrate)} : call)}),
+    };
   }
 
   // Look up the attachments that the client wants to send.
@@ -8452,6 +8482,16 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      if (msg.type === "message" && msg.toolCalls) {
+        msg.toolCalls = msg.toolCalls.map(call => {
+          if (call.toolName !== "executeCode" || !call.attachments) return call;
+          // The caller is inside commitAgentStep's transaction: references and content become
+          // committed together. The log stores metadata only; hydration supplies preview bytes.
+          this.commitChatAttachments(chatId, call.attachments);
+          return {...call, attachments: call.attachments.map(({content: _, ...ref}) => ref)};
+        });
+      }
+
       this.storage.chats.put({
         chatId,
         sequence,
@@ -8553,7 +8593,7 @@ class OverseerImpl implements AgentHooks {
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
                         worktreeTurn?: WorktreeTurnAccess)
-      : Promise<string> {
+      : Promise<CodeModeOutput> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
@@ -8616,10 +8656,11 @@ class OverseerImpl implements AgentHooks {
       }});
 
       let error: string | undefined;
+      let returned: unknown;
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        returned = await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -8632,25 +8673,44 @@ class OverseerImpl implements AgentHooks {
       let timeout = scheduler.wait(5000).then(() => { return null; })
       let trace = await Promise.race([tracePromise, timeout])
 
-      if (!trace) {
+      if (!trace && returned === undefined) {
         // Trace must have been lost... give up waiting.
         throw new Error("Timed out waiting for logs from code execution.");
       }
 
-      let log = trace.logs.map(log => {
+      let log = trace?.logs.map(log => {
         // Message is an array of params.
         return (log.message as any[]).map(part => {
           return typeof part === "string" ? part : JSON.stringify(part)
         }).join(" ");
-      }).join("\n");
+      }).join("\n") ?? "[Console logs unavailable.]";
+
+      let attachments: ChatAttachmentRef[] = [];
+      let resultError: string | undefined;
+      if (returned !== undefined) {
+        let decoded = decodeCodeModeOutput(returned);
+        if (decoded.output) log += (log ? "\n" : "") + decoded.output;
+        resultError = decoded.error;
+        this.sweepStagedChatAttachments();
+        for (let image of decoded.images) {
+          let id = crypto.randomUUID();
+          this.storage.chatAttachmentContent.put({
+            fileId: id, data: image.content,
+            state: {type: "staged", uploadedAt: Date.now(), mimeType: image.mimeType},
+          });
+          attachments.push({id, mimeType: image.mimeType, size: image.content.byteLength,
+                            content: image.content});
+        }
+      }
 
       if (error !== undefined) {
         log += `\n\nUncaught exception: ${error}`;
-      } else if (log === "") {
+      } else if (log === "" && attachments.length === 0) {
         log = "(function succeeded with no output)";
       }
 
-      return log;
+      return {output: log, ...(attachments.length > 0 && {attachments}),
+              ...((error ?? resultError) && {error: error ?? resultError})};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {
@@ -11750,7 +11810,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.ctx.storage.transactionSync(() => {
       for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
         if (msg.type === "message") {
-          for (let attachment of msg.attachments ?? []) {
+          let toolAttachments = msg.toolCalls?.flatMap(call =>
+              call.toolName === "executeCode" ? call.attachments ?? [] : []) ?? [];
+          for (let attachment of [...msg.attachments ?? [], ...toolAttachments]) {
             let content = this.impl.storage.chatAttachmentContent.get(attachment.id);
             if (content?.state.type === "committed" && content.state.chatId === chatId) {
               this.impl.storage.chatAttachmentContent.delete(attachment.id);
