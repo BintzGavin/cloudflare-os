@@ -78,7 +78,7 @@ it.each([
   {id: "failed-capture", code: 'return {isError: true, content: [{type: "text", text: "Capture failed."}]};'},
   {id: "ordinary-return", code: 'console.log("ordinary output"); return 7;'},
   {id: "oversized-image", code: 'return {content: [{type: "text", text: "Text survives."}, ' +
-      '{type: "image", mimeType: "image/png", data: "A".repeat(1398105)}]};'},
+      '{type: "image", mimeType: "image/png", data: "A".repeat(20971521)}]};'},
 ])("preserves the output contract for $id", ({id, code}) => withAgent([
   {toolCall: {id, name: "executeCode", arguments: {code: `export default async function() { ${code} }`}}},
   {text: "Result recorded."},
@@ -102,3 +102,33 @@ it.each([
     expect(imageUrls(model.requests.at(-1))).toEqual([]);
   }
 }));
+
+
+it("carries a 15 MiB image through WorkerLoader, storage, and model replay", () =>
+  withAgent([
+    {toolCall: {id: "large-image", name: "executeCode", arguments: {
+      code: `export default async function() {
+        let bytes = new Uint8Array(15 * 1024 * 1024);
+        bytes.set(Uint8Array.fromBase64("${PNG}"));
+        bytes[bytes.length - 1] = 127;
+        return {content: [{type: "image", mimeType: "image/png", data: bytes.toBase64()}]};
+      }`,
+    }}},
+    {text: "Large image received."},
+    {text: "The saved large image is still available."},
+  ], async (session, model) => {
+    const result = await session.runTurn("Return a large image.");
+    expect(result.outcome).toEqual({status: "completed"});
+    const first = imageUrls(model.requests[1]);
+    expect(first).toHaveLength(1);
+    const bytes = Buffer.from(first[0].split(",")[1], "base64");
+    expect(bytes.length).toBe(15 * 1024 * 1024);
+    expect(bytes[bytes.length - 1]).toBe(127);
+    const calls = result.history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
+    const call = calls.find(call => call.toolCallId === "large-image");
+    if (call?.toolName !== "executeCode") throw new Error("Missing image result.");
+    expect(call.attachments?.[0].size).toBe(bytes.length);
+    expect(call.attachments?.[0].content).toBeUndefined();
+    expect((await session.runTurn("Reuse the recorded image.")).outcome).toEqual({status: "completed"});
+    expect(imageUrls(model.requests[2])[0] === first[0]).toBe(true);
+  }));

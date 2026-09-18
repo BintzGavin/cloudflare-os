@@ -1,9 +1,12 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ChatAttachmentRef, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import {
-  isAllowedChatAttachmentImageMimeType, MAX_CHAT_ATTACHMENT_BYTES,
+  isAllowedChatAttachmentImageMimeType,
   MAX_CHAT_ATTACHMENTS_PER_MESSAGE, validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
+
+/** Decoded image budget per execution; base64 and framing must fit in a 32 MiB RPC. */
+export const MAX_CODE_IMAGE_BYTES = 15 * 1024 * 1024;
 
 /** Recorded text and staged image references from one code execution. */
 export type CodeModeOutput = {
@@ -23,6 +26,7 @@ export function decodeCodeModeOutput(value: unknown): {
   let text: string[] = [];
   let images: ChatAttachmentUpload[] = [];
   let remainingText = 65536;
+  let remainingImageBytes = MAX_CODE_IMAGE_BYTES;
   for (let block of value.content.slice(0, 64)) {
     if (typeof block !== "object" || block === null) {
       text.push("[Unsupported output content.]");
@@ -37,7 +41,7 @@ export function decodeCodeModeOutput(value: unknown): {
           throw new Error("Too many images; at most five can be returned per execution.");
         }
         if (typeof block.data !== "string" ||
-            block.data.length > Math.ceil(MAX_CHAT_ATTACHMENT_BYTES / 3) * 4) {
+            block.data.length > Math.ceil(remainingImageBytes / 3) * 4) {
           throw new Error("Image data is missing or too large.");
         }
         if (typeof block.mimeType !== "string" ||
@@ -48,7 +52,9 @@ export function decodeCodeModeOutput(value: unknown): {
           throw new Error("Invalid image base64.");
         }
         let content = Uint8Array.fromBase64(block.data, {lastChunkHandling: "strict"});
-        images.push(validateChatAttachmentUpload({mimeType: block.mimeType, content}));
+        images.push(validateChatAttachmentUpload(
+            {mimeType: block.mimeType, content}, undefined, remainingImageBytes));
+        remainingImageBytes -= content.byteLength;
       } catch (error) {
         text.push(`[Image omitted: ${error instanceof Error ? error.message : "invalid image"}]`);
       }

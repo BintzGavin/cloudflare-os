@@ -60,7 +60,7 @@ import {
   MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENTS_PER_MESSAGE,
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
-import { decodeCodeModeOutput, type CodeModeOutput } from "./code-mode-output";
+import { decodeCodeModeOutput, MAX_CODE_IMAGE_BYTES, type CodeModeOutput } from "./code-mode-output";
 import { renderGadgetInBrowser } from "./browser-export";
 import {
   defaultExportFormats,
@@ -102,6 +102,7 @@ export default class extends WorkerEntrypoint {
     if (Array.isArray(result?.content)) {
       // Bound the explicit result before RPC. Image bytes must never enter tail logs.
       let images = 0;
+      let remainingImageChars = ${Math.ceil(MAX_CODE_IMAGE_BYTES / 3) * 4};
       let remainingText = 65536;
       let content = result.content.slice(0, 64).map(block => {
         if (block?.type === "text" && typeof block.text === "string") {
@@ -112,8 +113,9 @@ export default class extends WorkerEntrypoint {
         }
         if (block?.type === "image" && ++images <= ${MAX_CHAT_ATTACHMENTS_PER_MESSAGE} &&
             typeof block.data === "string" &&
-            block.data.length <= ${Math.ceil(MAX_CHAT_ATTACHMENT_BYTES / 3) * 4} &&
+            block.data.length <= remainingImageChars &&
             typeof block.mimeType === "string" && block.mimeType.length <= 100) {
+          remainingImageChars -= block.data.length;
           return {type: "image", data: block.data, mimeType: block.mimeType};
         }
         return {type: "text", text: "[Output omitted: unsupported content or image limit exceeded.]"};
@@ -648,6 +650,8 @@ function validateChatAttachmentId(id: string): string {
 type ChatAttachmentContentRecord = {
   fileId: string;
   data: Uint8Array;
+  // Large code results keep their first chunk here; old inline records need no migration.
+  size?: number;
   state:
     | {
         type: "staged";
@@ -1446,6 +1450,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           },
         },
       }),
+
+      chatAttachmentChunks: collection<{key: string; data: Uint8Array}>()({primaryKey: "key"}),
 
       // Non-owner collaborators who have configured their gatekeeper accounts and passed all
       // `addObserver` checks. See `ObserverRecord`. The secondary index lets the forward-exclusion
@@ -5675,12 +5681,57 @@ class OverseerImpl implements AgentHooks {
     this.#associateAction(caller, actionId);
   }
 
+  // Keep each storage value below SQLite's 2 MB row limit. Metadata and chunks are staged
+  // atomically; committing an attachment only changes the metadata's ownership.
+  stageChatAttachment(attachment: ChatAttachmentUpload): ChatAttachmentRef {
+    let id = crypto.randomUUID();
+    let {content, mimeType, name} = attachment;
+    this.ctx.storage.transactionSync(() => {
+      this.storage.chatAttachmentContent.put({
+        fileId: id, data: content.slice(0, MAX_CHAT_ATTACHMENT_BYTES),
+        ...(content.length > MAX_CHAT_ATTACHMENT_BYTES && {size: content.length}),
+        state: {type: "staged", uploadedAt: Date.now(), mimeType, name},
+      });
+      for (let offset = MAX_CHAT_ATTACHMENT_BYTES; offset < content.length;
+          offset += MAX_CHAT_ATTACHMENT_BYTES) {
+        this.storage.chatAttachmentChunks.put({
+          key: `${id}:${offset}`, data: content.slice(offset, offset + MAX_CHAT_ATTACHMENT_BYTES),
+        });
+      }
+    });
+    return {id, mimeType, name, size: content.length, content};
+  }
+
+  private readChatAttachmentData(record: ChatAttachmentContentRecord): Uint8Array {
+    if (record.size === undefined) return record.data;
+    let bytes = new Uint8Array(record.size);
+    bytes.set(record.data);
+    for (let offset = MAX_CHAT_ATTACHMENT_BYTES; offset < record.size;
+        offset += MAX_CHAT_ATTACHMENT_BYTES) {
+      let chunk = this.storage.chatAttachmentChunks.get(`${record.fileId}:${offset}`);
+      if (!chunk || chunk.data.length !== Math.min(MAX_CHAT_ATTACHMENT_BYTES, record.size - offset)) {
+        throw new Error("Chat attachment content is incomplete.");
+      }
+      bytes.set(chunk.data, offset);
+    }
+    return bytes;
+  }
+
+  deleteChatAttachmentContent(id: string): void {
+    this.ctx.storage.transactionSync(() => {
+      for (let chunk of this.storage.chatAttachmentChunks.list({prefix: `${id}:`})) {
+        this.storage.chatAttachmentChunks.delete(chunk.key);
+      }
+      this.storage.chatAttachmentContent.delete(id);
+    });
+  }
+
   async getChatAttachmentData(chatId: number, id: string): Promise<Uint8Array> {
     let content = this.storage.chatAttachmentContent.get(validateChatAttachmentId(id));
     if (!content || content.state.type !== "committed" || content.state.chatId !== chatId) {
       throw new Error("Chat attachment not found.");
     }
-    return content.data;
+    return this.readChatAttachmentData(content);
   }
 
   // Prepare a stored chat message for delivery to a client: inline image attachment bytes
@@ -5714,7 +5765,8 @@ class OverseerImpl implements AgentHooks {
       }
       let content = this.storage.chatAttachmentContent.get(a.id);
       if (!content || content.state.type !== "committed" || content.state.chatId !== msg.chatId) return a;
-      return {...a, content: content.data};
+      // Fetch large images individually when previewed, rather than bloating every history page.
+      return content.size === undefined ? {...a, content: content.data} : a;
     };
     return {...msg,
       ...(msg.attachments && {attachments: msg.attachments.map(hydrate)}),
@@ -5771,8 +5823,7 @@ class OverseerImpl implements AgentHooks {
         throw new Error("Chat attachment is no longer available.");
       }
       this.storage.chatAttachmentContent.put({
-        fileId: id,
-        data: content.data,
+        ...content,
         state: {type: "committed", chatId},
       });
     }
@@ -5782,7 +5833,7 @@ class OverseerImpl implements AgentHooks {
     let cutoff = Date.now() - MAX_STAGED_CHAT_ATTACHMENT_AGE_MS;
     this.ctx.storage.transactionSync(() => {
       for (let content of Array.from(this.storage.chatAttachmentContent.stagedByUploadedAt.list({end: cutoff}))) {
-        this.storage.chatAttachmentContent.delete(content.fileId);
+        this.deleteChatAttachmentContent(content.fileId);
       }
     });
   }
@@ -8693,13 +8744,7 @@ class OverseerImpl implements AgentHooks {
         resultError = decoded.error;
         this.sweepStagedChatAttachments();
         for (let image of decoded.images) {
-          let id = crypto.randomUUID();
-          this.storage.chatAttachmentContent.put({
-            fileId: id, data: image.content,
-            state: {type: "staged", uploadedAt: Date.now(), mimeType: image.mimeType},
-          });
-          attachments.push({id, mimeType: image.mimeType, size: image.content.byteLength,
-                            content: image.content});
+          attachments.push(this.stageChatAttachment(image));
         }
       }
 
@@ -11561,18 +11606,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // Fetch the bytes of a committed chat attachment over the authenticated RPC connection. The
   // caller already has its canonical metadata from the ChatAttachmentRef in the message.
   async getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array> {
-    let content = this.impl.storage.chatAttachmentContent.get(validateChatAttachmentId(id));
-    if (!content || content.state.type !== "committed" || content.state.chatId !== chatId) {
-      throw new Error("Chat attachment not found.");
-    }
-    return content.data;
+    return this.impl.getChatAttachmentData(chatId, id);
   }
 
   async deleteChatAttachment(id: string): Promise<void> {
     id = validateChatAttachmentId(id);
     let content = this.impl.storage.chatAttachmentContent.get(id);
     if (content?.state.type === "staged") {
-      this.impl.storage.chatAttachmentContent.delete(id);
+      this.impl.deleteChatAttachmentContent(id);
     }
   }
 
@@ -11815,7 +11856,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           for (let attachment of [...msg.attachments ?? [], ...toolAttachments]) {
             let content = this.impl.storage.chatAttachmentContent.get(attachment.id);
             if (content?.state.type === "committed" && content.state.chatId === chatId) {
-              this.impl.storage.chatAttachmentContent.delete(attachment.id);
+              this.impl.deleteChatAttachmentContent(attachment.id);
             }
           }
         }

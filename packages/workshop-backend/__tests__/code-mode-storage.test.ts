@@ -90,3 +90,40 @@ it("sweeps abandoned images without deleting committed evidence", async () => {
     expect(await impl.getChatAttachmentData(1, committed.id)).toEqual(PNG);
   });
 });
+
+
+it("persists a 15 MiB image across restart, fetches it on demand, and cleans up staged chunks", async () => {
+  let name = crypto.randomUUID();
+  let bytes = new Uint8Array(15 * 1024 * 1024);
+  bytes.set(PNG);
+  bytes[bytes.length - 1] = 127;
+  let imageId = "";
+  await runInDurableObject(env.TEST_OVERSEER.getByName(name), async instance => {
+    let impl = instance["impl"];
+    impl.storage.chatMeta.put({id: 1, title: "Large image", started: new Date(), lastActive: new Date()});
+    let attachment = impl.stageChatAttachment({mimeType: "image/png", content: bytes});
+    imageId = attachment.id;
+    await impl.commitAgentStep(1, AUTHOR, [message(attachment)], EMPTY_STEP);
+    let stored = [...impl.storage.chats.list()][0];
+    // History remains small even when a conversation contains many large images.
+    expect(JSON.stringify(impl.hydrateChatMessageForClient(stored))).not.toContain('"content"');
+  });
+  await abortAllDurableObjects();
+  await runInDurableObject(env.TEST_OVERSEER.getByName(name), async instance => {
+    let impl = instance["impl"];
+    let restored = await impl.getChatAttachmentData(1, imageId);
+    expect(restored.length).toBe(bytes.length);
+    expect(restored.every((byte, index) => byte === bytes[index])).toBe(true);
+    await expect(impl.getChatAttachmentData(2, imageId)).rejects.toThrow("not found");
+    let abandoned = impl.stageChatAttachment({mimeType: "image/png", content: bytes});
+    let staged = impl.storage.chatAttachmentContent.get(abandoned.id)!;
+    impl.storage.chatAttachmentContent.put({...staged, state: {type: "staged", uploadedAt: 0, mimeType: "image/png"}});
+    impl.sweepStagedChatAttachments();
+    expect(impl.storage.chatAttachmentContent.get(abandoned.id)).toBeUndefined();
+    expect([...impl.storage.chatAttachmentChunks.list({prefix: abandoned.id + ":"})]).toEqual([]);
+    expect((await impl.getChatAttachmentData(1, imageId)).every((byte, index) => byte === bytes[index])).toBe(true);
+    impl.deleteChatAttachmentContent(imageId);
+    expect([...impl.storage.chatAttachmentChunks.list()]).toEqual([]);
+    await expect(impl.getChatAttachmentData(1, imageId)).rejects.toThrow("not found");
+  });
+});

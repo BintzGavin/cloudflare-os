@@ -18,7 +18,7 @@ describe("explicit code output", () => {
     {label: "wrong MIME signature", image: {...IMAGE, data: "YWJjZA=="}},
     {label: "unsupported image", image: {...IMAGE, mimeType: "image/svg+xml"}},
     {label: "missing MIME", image: {type: "image", data: PNG}},
-    {label: "oversized image", image: {...IMAGE, data: "A".repeat(1398105)}},
+    {label: "oversized image", image: {...IMAGE, data: "A".repeat(20971521)}},
   ])("retains useful text when rejecting $label", ({image}) => {
     let result = decodeCodeModeOutput({content: [{type: "text", text: "Useful text."}, image]});
     expect(result.images).toEqual([]);
@@ -28,7 +28,7 @@ describe("explicit code output", () => {
   });
 
   it("admits the exact byte limit and rejects one byte beyond it", () => {
-    let bytes = new Uint8Array(1024 * 1024);
+    let bytes = new Uint8Array(15 * 1024 * 1024);
     bytes.set([0x89, 0x50, 0x4e, 0x47]);
     expect(decodeCodeModeOutput({content: [{...IMAGE, data: bytes.toBase64()}]}).images)
         .toHaveLength(1);
@@ -36,6 +36,15 @@ describe("explicit code output", () => {
     tooMany.set(bytes);
     expect(decodeCodeModeOutput({content: [{...IMAGE, data: tooMany.toBase64()}]}).images)
         .toHaveLength(0);
+  });
+
+  it("bounds all returned images together to 15 MiB", () => {
+    let bytes = new Uint8Array(8 * 1024 * 1024);
+    bytes.set([0x89, 0x50, 0x4e, 0x47]);
+    let image = {...IMAGE, data: bytes.toBase64()};
+    let result = decodeCodeModeOutput({content: [image, image, IMAGE]});
+    expect(result.images.map(attachment => attachment.content.length)).toEqual([bytes.length, 68]);
+    expect(result.output).toContain("Image omitted:");
   });
 
   it("keeps five images and reports the omitted sixth", () => {

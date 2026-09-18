@@ -59,8 +59,9 @@ export function assertChatAttachmentSupportedByProvider(
   provider: AiModelProvider | undefined,
   mimeType: string,
   byteLength: number,
+  maxBytes: number = MAX_CHAT_ATTACHMENT_BYTES,
 ): void {
-  if (byteLength > MAX_CHAT_ATTACHMENT_BYTES) {
+  if (byteLength > maxBytes) {
     throw new Error("Chat attachment is too large.");
   }
 
@@ -78,10 +79,11 @@ export function assertChatAttachmentSupportedByProvider(
 export function validateChatAttachmentUpload(
   attachment: ChatAttachmentUpload,
   provider?: AiModelConfig["provider"],
+  maxBytes: number = MAX_CHAT_ATTACHMENT_BYTES,
 ): ChatAttachmentUpload {
   attachment.name = sanitizeChatAttachmentName(attachment.name);
   attachment.mimeType = sanitizeChatAttachmentMimeType(attachment.mimeType);
-  assertChatAttachmentSupportedByProvider(provider, attachment.mimeType, attachment.content.byteLength);
+  assertChatAttachmentSupportedByProvider(provider, attachment.mimeType, attachment.content.byteLength, maxBytes);
 
   let signature = CONTENT_SIGNATURES.get(attachment.mimeType);
   if (signature) {
