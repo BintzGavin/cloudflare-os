@@ -44,6 +44,7 @@ const TYPES_CODE = `
 /** A stand-in resource whose reads and writes are deterministic and audited. */
 interface TestThing {
   readValue(): Promise<number>;
+  readImage(): Promise<{content: {type: "image", mimeType: string, data: string}[]}>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
 }
@@ -303,6 +304,7 @@ export class TestVerifier
 export interface TestSession {
   /** `restricted` marks the observation `containsRestrictedData`. */
   readValue(restricted?: boolean): Promise<number>;
+  readImage(): Promise<{content: {type: "image", mimeType: string, data: string}[]}>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
 }
@@ -326,6 +328,18 @@ class TestSessionTarget extends RpcTarget implements TestSession {
       ...(restricted ? { containsRestrictedData: true } : {}),
     });
     return 42;
+  }
+
+  async readImage(): Promise<{content: {type: "image", mimeType: string, data: string}[]}> {
+    await this.approvalQueue.authorizeObservation({
+      title: "Read the test image",
+      description: "Read a deterministic PNG through the real gatekeeper RPC boundary.",
+    });
+    return {content: [{
+      type: "image",
+      mimeType: "image/png",
+      data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    }]};
   }
 
   async writeValue(value: number): Promise<number> {

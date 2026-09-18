@@ -40,7 +40,7 @@ vi.mock('./AuthContext', () => {
   }
 })
 
-import { entry, makeOverseer, makeTestRoot } from './action-test-harness'
+import { entry, flushFrames, makeOverseer, makeTestRoot } from './action-test-harness'
 import ChatInterface from './ChatInterface'
 import { linkActionLog } from './useActions'
 
@@ -74,12 +74,12 @@ function withChatApi(
   }
 }
 
-function renderChat(overseer: RpcStub<Overseer>) {
+function renderChat(overseer: RpcStub<Overseer>, selectedChatId: number | null = null) {
   return testRoot.render(
     <ChatInterface
       workspaceId="workspace"
       overseer={overseer}
-      selectedChatId={null}
+      selectedChatId={selectedChatId}
       onNavigateToChat={() => {}}
       pendingConsoleLogCount={0}
       consoleLogPreview=""
@@ -138,4 +138,65 @@ describe('ChatInterface action refresh', () => {
     await second.resolvePendingQuery({ entries: [entry(1)] })
     expect(secondChat.getChatMessage).not.toHaveBeenCalled()
   })
+})
+
+it.each([false, true])('opens a recorded code-result image and restores focus (deferred: %s)', async deferred => {
+  const originalUrl = URL
+  const createUrl = vi.fn<(blob: Blob) => string>(() => 'blob:recorded-image')
+  const revokeUrl = vi.fn<(url: string) => void>()
+  const scrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTo')
+  Object.defineProperty(HTMLElement.prototype, 'scrollTo', { configurable: true, value: vi.fn<() => void>() })
+  vi.stubGlobal('URL', class extends originalUrl {
+    static createObjectURL = createUrl
+    static revokeObjectURL = revokeUrl
+  })
+  try {
+    const server = makeOverseer()
+    withChatApi(server)
+    const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    const message: AiChatMessage = {
+      type: 'message', chatId: 1, sequence: 0, timestamp: new Date(),
+      author: { type: 'agent', id: 'model', name: 'Model' }, message: '',
+      toolCalls: [{
+        toolCallId: 'capture', toolName: 'executeCode', input: { code: 'return capture;' },
+        output: 'Captured.', attachments: [{
+          id: 'image', mimeType: 'image/png', name: 'capture.png', size: deferred ? 15 * 1024 * 1024 : image.length,
+          ...(deferred ? {} : {content: image}),
+        }],
+      }],
+    }
+    const loadImage = vi.fn<(chatId: number, id: string) => Promise<Uint8Array>>(async () => image)
+    Object.assign(server.overseer as object, {
+      getChatAttachmentContent: loadImage,
+      listChats: async () => [{ id: 1, title: 'Images', started: new Date(), lastActive: new Date() }],
+      getChatHistory: async () => ({ messages: [message] }),
+    })
+    await renderChat(server.overseer, 1)
+    await server.resolveSubscription()
+    await server.resolvePendingQuery({ entries: [] })
+    flushFrames()
+    const run = [...document.querySelectorAll('button')].find(button => button.textContent === 'Ran code return capture;')
+    expect(run).toBeDefined()
+    act(() => run!.click())
+    const preview = document.querySelector<HTMLButtonElement>('[aria-label="Preview capture.png"]')
+    expect(preview).not.toBeNull()
+    expect(loadImage).not.toHaveBeenCalled()
+    expect(preview!.querySelector('img')?.getAttribute('src')).toBe(deferred ? undefined : 'blob:recorded-image')
+    preview!.focus()
+    await act(async () => preview!.click())
+    expect(loadImage.mock.calls).toEqual(deferred ? [[1, 'image']] : [])
+    flushFrames()
+    expect(document.querySelector('[role="dialog"] img')?.getAttribute('src')).toBe('blob:recorded-image')
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Close preview')
+    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.activeElement).toBe(preview)
+    expect(createUrl.mock.calls[0][0]).toMatchObject({ size: image.length, type: 'image/png' })
+    testRoot.unmount()
+    expect(revokeUrl).toHaveBeenCalled()
+  } finally {
+    vi.stubGlobal('URL', originalUrl)
+    if (scrollTo) Object.defineProperty(HTMLElement.prototype, 'scrollTo', scrollTo)
+    else Reflect.deleteProperty(HTMLElement.prototype, 'scrollTo')
+  }
 })

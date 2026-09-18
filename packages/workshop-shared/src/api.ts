@@ -3293,6 +3293,9 @@ export type AiToolCall = {
 
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
+
+  /** Images explicitly returned by this execution. Bytes are inlined for client previews. */
+  attachments?: ChatAttachmentRef[];
 } | {
   /**
    * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer
