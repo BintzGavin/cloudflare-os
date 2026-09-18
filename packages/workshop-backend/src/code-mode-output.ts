@@ -8,66 +8,47 @@ import {
 /** Decoded image budget per execution; base64 and framing must fit in a 32 MiB RPC. */
 export const MAX_CODE_IMAGE_BYTES = 15 * 1024 * 1024;
 
-/** Recorded text and staged image references from one code execution. */
+/** Recorded console output and staged image references from one code execution. */
 export type CodeModeOutput = {
   output: string;
   attachments?: ChatAttachmentRef[];
-  error?: string;
 };
 
-/** Decode only the explicit content envelope, never arbitrary objects or console logs. */
-export function decodeCodeModeOutput(value: unknown): {
-  output: string; images: ChatAttachmentUpload[]; error?: string;
+/**
+ * Validate the image blocks the code-mode harness lifted out of an execution's return value.
+ * The harness shares an isolate with the agent's code, so every limit is enforced here. A
+ * rejected image becomes a note for the model rather than failing the execution.
+ */
+export function decodeCodeModeImages(value: unknown): {
+  images: ChatAttachmentUpload[]; notes: string[];
 } {
-  if (typeof value !== "object" || value === null ||
-      !("content" in value) || !Array.isArray(value.content)) {
-    throw new Error("Invalid code output envelope.");
-  }
-  let text: string[] = [];
+  if (!Array.isArray(value)) throw new Error("Invalid code output images.");
   let images: ChatAttachmentUpload[] = [];
-  let remainingText = 65536;
-  let remainingImageBytes = MAX_CODE_IMAGE_BYTES;
-  for (let block of value.content.slice(0, 64)) {
-    if (typeof block !== "object" || block === null) {
-      text.push("[Unsupported output content.]");
-    } else if (block.type === "text" && typeof block.text === "string") {
-      let kept = block.text.slice(0, remainingText);
-      text.push(kept);
-      remainingText -= kept.length;
-      if (kept.length < block.text.length) text.push("[Output text truncated.]");
-    } else if (block.type === "image") {
-      try {
-        if (images.length >= MAX_CHAT_ATTACHMENTS_PER_MESSAGE) {
-          throw new Error("Too many images; at most five can be returned per execution.");
-        }
-        if (typeof block.data !== "string" ||
-            block.data.length > Math.ceil(remainingImageBytes / 3) * 4) {
-          throw new Error("Image data is missing or too large.");
-        }
-        if (typeof block.mimeType !== "string" ||
-            !isAllowedChatAttachmentImageMimeType(block.mimeType)) {
-          throw new Error("Unsupported image format; use PNG, JPEG, or WebP.");
-        }
-        if (/[^A-Za-z0-9+/=]/.test(block.data)) {
-          throw new Error("Invalid image base64.");
-        }
-        let content = Uint8Array.fromBase64(block.data, {lastChunkHandling: "strict"});
-        images.push(validateChatAttachmentUpload(
-            {mimeType: block.mimeType, content}, undefined, remainingImageBytes));
-        remainingImageBytes -= content.byteLength;
-      } catch (error) {
-        text.push(`[Image omitted: ${error instanceof Error ? error.message : "invalid image"}]`);
+  let notes: string[] = [];
+  let remainingBytes = MAX_CODE_IMAGE_BYTES;
+  for (let [index, block] of value.slice(0, MAX_CHAT_ATTACHMENTS_PER_MESSAGE).entries()) {
+    try {
+      if (typeof block?.data !== "string" ||
+          block.data.length > Math.ceil(remainingBytes / 3) * 4) {
+        throw new Error("Image data is missing or too large.");
       }
-    } else {
-      text.push("[Unsupported output content; return text or image blocks.]");
+      if (typeof block.mimeType !== "string" ||
+          !isAllowedChatAttachmentImageMimeType(block.mimeType)) {
+        throw new Error("Unsupported image format; use PNG, JPEG, or WebP.");
+      }
+      let content = Uint8Array.fromBase64(block.data, {lastChunkHandling: "strict"});
+      images.push(validateChatAttachmentUpload(
+          {mimeType: block.mimeType, content}, undefined, remainingBytes));
+      remainingBytes -= content.byteLength;
+    } catch (error) {
+      notes.push(`[Image ${index + 1} omitted: ` +
+          `${error instanceof Error ? error.message : "invalid image"}]`);
     }
   }
-  if (value.content.length > 64) text.push("[Additional output content omitted.]");
-  return {
-    output: text.join("\n"), images,
-    ...("isError" in value && value.isError === true
-      ? {error: "Returned tool result reported an error."} : {}),
-  };
+  if (value.length > MAX_CHAT_ATTACHMENTS_PER_MESSAGE) {
+    notes.push("[Later images omitted: at most five can be returned per execution.]");
+  }
+  return {images, notes};
 }
 
 /** Build model input from the same image bytes used for the chat preview. */

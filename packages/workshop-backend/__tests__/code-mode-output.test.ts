@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { codeModeImageContent, decodeCodeModeOutput } from "../src/code-mode-output.js";
+import { codeModeImageContent, decodeCodeModeImages } from "../src/code-mode-output.js";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 const IMAGE = {type: "image", mimeType: "image/png", data: PNG};
 
-describe("explicit code output", () => {
-  it("preserves text and exact image bytes without putting base64 into text", () => {
-    let result = decodeCodeModeOutput({content: [{type: "text", text: "Captured."}, IMAGE]});
-    expect(result.output).toBe("Captured.");
-    expect(result.images).toEqual([{mimeType: "image/png", content: Uint8Array.fromBase64(PNG)}]);
+describe("returned code images", () => {
+  it("preserves exact image bytes", () => {
+    expect(decodeCodeModeImages([IMAGE])).toEqual({
+      images: [{mimeType: "image/png", content: Uint8Array.fromBase64(PNG)}], notes: [],
+    });
   });
 
   it.each([
@@ -17,58 +17,42 @@ describe("explicit code output", () => {
     {label: "invalid trailing bits", image: {...IMAGE, data: "AB=="}},
     {label: "wrong MIME signature", image: {...IMAGE, data: "YWJjZA=="}},
     {label: "unsupported image", image: {...IMAGE, mimeType: "image/svg+xml"}},
-    {label: "missing MIME", image: {type: "image", data: PNG}},
+    {label: "missing MIME", image: {data: PNG}},
+    {label: "missing data", image: {mimeType: "image/png"}},
+    {label: "non-object block", image: null},
     {label: "oversized image", image: {...IMAGE, data: "A".repeat(20971521)}},
-  ])("retains useful text when rejecting $label", ({image}) => {
-    let result = decodeCodeModeOutput({content: [{type: "text", text: "Useful text."}, image]});
-    expect(result.images).toEqual([]);
-    expect(result.output).toContain("Useful text.");
-    expect(result.output).toContain("Image omitted:");
-    expect(result.output.length).toBeLessThan(250);
+  ])("omits $label with a short note and keeps the valid image beside it", ({image}) => {
+    let result = decodeCodeModeImages([image, IMAGE]);
+    expect(result.images).toEqual([{mimeType: "image/png", content: Uint8Array.fromBase64(PNG)}]);
+    expect(result.notes).toEqual([expect.stringMatching(/^\[Image 1 omitted: .{1,100}\]$/)]);
   });
 
   it("admits the exact byte limit and rejects one byte beyond it", () => {
     let bytes = new Uint8Array(15 * 1024 * 1024);
     bytes.set([0x89, 0x50, 0x4e, 0x47]);
-    expect(decodeCodeModeOutput({content: [{...IMAGE, data: bytes.toBase64()}]}).images)
-        .toHaveLength(1);
+    expect(decodeCodeModeImages([{...IMAGE, data: bytes.toBase64()}]).images).toHaveLength(1);
     let tooMany = new Uint8Array(bytes.length + 1);
     tooMany.set(bytes);
-    expect(decodeCodeModeOutput({content: [{...IMAGE, data: tooMany.toBase64()}]}).images)
-        .toHaveLength(0);
+    expect(decodeCodeModeImages([{...IMAGE, data: tooMany.toBase64()}]).images).toHaveLength(0);
   });
 
   it("bounds all returned images together to 15 MiB", () => {
     let bytes = new Uint8Array(8 * 1024 * 1024);
     bytes.set([0x89, 0x50, 0x4e, 0x47]);
     let image = {...IMAGE, data: bytes.toBase64()};
-    let result = decodeCodeModeOutput({content: [image, image, IMAGE]});
+    let result = decodeCodeModeImages([image, image, IMAGE]);
     expect(result.images.map(attachment => attachment.content.length)).toEqual([bytes.length, 68]);
-    expect(result.output).toContain("Image omitted:");
+    expect(result.notes).toEqual([expect.stringContaining("Image 2 omitted:")]);
   });
 
-  it("keeps five images and reports the omitted sixth", () => {
-    let result = decodeCodeModeOutput({content: Array.from({length: 6}, () => ({...IMAGE}))});
+  it("considers only the first five images, however many follow", () => {
+    let result = decodeCodeModeImages(Array.from({length: 5000}, () => ({...IMAGE})));
     expect(result.images).toHaveLength(5);
-    expect(result.output).toContain("Too many images");
+    expect(result.notes).toEqual([expect.stringContaining("at most five")]);
   });
 
-  it("does not recursively interpret arbitrary return values", () => {
-    expect(() => decodeCodeModeOutput({nested: {content: [IMAGE]}})).toThrow("Invalid code output");
-  });
-
-  it("bounds the combined text across content blocks", () => {
-    let result = decodeCodeModeOutput({content: [
-      {type: "text", text: "a".repeat(65536)}, {type: "text", text: "b".repeat(65536)},
-    ]});
-    expect(result.output.length).toBeLessThan(65600);
-    expect(result.output).toContain("Output text truncated");
-  });
-
-  it("retains the producing tool's failure alongside its content", () => {
-    let result = decodeCodeModeOutput({isError: true, content: [{type: "text", text: "Capture failed."}]});
-    expect(result.output).toBe("Capture failed.");
-    expect(result.error).toBe("Returned tool result reported an error.");
+  it("rejects anything but the harness's image list", () => {
+    expect(() => decodeCodeModeImages({content: [IMAGE]})).toThrow("Invalid code output");
   });
 });
 

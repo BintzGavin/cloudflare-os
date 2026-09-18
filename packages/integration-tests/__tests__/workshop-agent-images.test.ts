@@ -79,6 +79,9 @@ it.each([
   {id: "ordinary-return", code: 'console.log("ordinary output"); return 7;'},
   {id: "oversized-image", code: 'return {content: [{type: "text", text: "Text survives."}, ' +
       '{type: "image", mimeType: "image/png", data: "A".repeat(20971521)}]};'},
+  {id: "structured-result", code: 'return {structuredContent: {total: 3}, content: [' +
+      '{type: "resource", resource: {uri: "doc://1", text: "Embedded body."}}, ' +
+      `{type: "image", mimeType: "image/png", data: "${PNG}"}]};`},
 ])("preserves the output contract for $id", ({id, code}) => withAgent([
   {toolCall: {id, name: "executeCode", arguments: {code: `export default async function() { ${code} }`}}},
   {text: "Result recorded."},
@@ -88,18 +91,26 @@ it.each([
   const calls = result.history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
   const call = calls.find(call => call.toolCallId === id);
   if (call?.toolName !== "executeCode") throw new Error("Missing executed code result.");
+  // Returning a result never turns a completed execution into a failed tool call.
+  expect(call.error).toBeUndefined();
   if (id === "failed-capture") {
-    expect(call.error).toContain("reported an error");
-    expect(call.output).toBe("Capture failed.");
+    expect(call.output).toContain('"isError":true');
+    expect(call.output).toContain("Capture failed.");
   } else if (id === "ordinary-return") {
     expect(call.output).toContain("ordinary output");
     expect(call.output).toContain("Return value: 7");
-    expect(call.error).toBeUndefined();
-  } else {
+  } else if (id === "oversized-image") {
     expect(call.output).toContain("Text survives.");
-    expect(call.output).toContain("image limit exceeded");
-    expect(call.output!.length).toBeLessThan(200);
+    expect(call.output).toContain("[Image 1 omitted:");
+    expect(call.output!.length).toBeLessThan(300);
     expect(imageUrls(model.requests.at(-1))).toEqual([]);
+  } else {
+    // Only image data leaves the logged value; everything else reaches the model as before.
+    expect(call.output).toContain('"structuredContent":{"total":3}');
+    expect(call.output).toContain("Embedded body.");
+    expect(call.output).toContain('"data":"[image 1]"');
+    expect(call.output).not.toContain(PNG);
+    expect(imageUrls(model.requests.at(-1))).toEqual([`data:image/png;base64,${PNG}`]);
   }
 }));
 

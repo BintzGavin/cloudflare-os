@@ -60,7 +60,7 @@ import {
   MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENTS_PER_MESSAGE,
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
-import { decodeCodeModeOutput, MAX_CODE_IMAGE_BYTES, type CodeModeOutput } from "./code-mode-output";
+import { decodeCodeModeImages, type CodeModeOutput } from "./code-mode-output";
 import { renderGadgetInBrowser } from "./browser-export";
 import {
   defaultExportFormats,
@@ -99,33 +99,20 @@ export default class extends WorkerEntrypoint {
       }
     }
     let result = await agent(self, env, this.ctx);
+    // Image blocks of an MCP-style result return over RPC, so their base64 never enters the tail
+    // log. The rest of the result is logged as before. The overseer enforces every limit: this
+    // code shares an isolate with the agent's, so a check here would protect nothing.
+    let images = [];
     if (Array.isArray(result?.content)) {
-      // Bound the explicit result before RPC. Image bytes must never enter tail logs.
-      let images = 0;
-      let remainingImageChars = ${Math.ceil(MAX_CODE_IMAGE_BYTES / 3) * 4};
-      let remainingText = 65536;
-      let content = result.content.slice(0, 64).map(block => {
-        if (block?.type === "text" && typeof block.text === "string") {
-          let kept = block.text.slice(0, remainingText);
-          remainingText -= kept.length;
-          return {type: "text", text: kept +
-              (kept.length < block.text.length ? "\\n[Output text truncated.]" : "")};
-        }
-        if (block?.type === "image" && ++images <= ${MAX_CHAT_ATTACHMENTS_PER_MESSAGE} &&
-            typeof block.data === "string" &&
-            block.data.length <= remainingImageChars &&
-            typeof block.mimeType === "string" && block.mimeType.length <= 100) {
-          remainingImageChars -= block.data.length;
-          return {type: "image", data: block.data, mimeType: block.mimeType};
-        }
-        return {type: "text", text: "[Output omitted: unsupported content or image limit exceeded.]"};
+      let content = result.content.map(block => {
+        if (block?.type !== "image" || typeof block.data !== "string") return block;
+        images.push({mimeType: block.mimeType, data: block.data});
+        return {...block, data: "[image " + images.length + "]"};
       });
-      if (result.content.length > 64) {
-        content.push({type: "text", text: "[Additional output content omitted.]"});
-      }
-      return {content, isError: result.isError === true};
+      if (images.length > 0) result = {...result, content};
     }
     if (result !== undefined) console.log("Return value:", result);
+    if (images.length > 0) return images;
   }
 }
 `;
@@ -8724,38 +8711,33 @@ class OverseerImpl implements AgentHooks {
       let timeout = scheduler.wait(5000).then(() => { return null; })
       let trace = await Promise.race([tracePromise, timeout])
 
-      if (!trace && returned === undefined) {
+      if (!trace) {
         // Trace must have been lost... give up waiting.
         throw new Error("Timed out waiting for logs from code execution.");
       }
 
-      let log = trace?.logs.map(log => {
+      let log = trace.logs.map(log => {
         // Message is an array of params.
         return (log.message as any[]).map(part => {
           return typeof part === "string" ? part : JSON.stringify(part)
         }).join(" ");
-      }).join("\n") ?? "[Console logs unavailable.]";
+      }).join("\n");
 
       let attachments: ChatAttachmentRef[] = [];
-      let resultError: string | undefined;
       if (returned !== undefined) {
-        let decoded = decodeCodeModeOutput(returned);
-        if (decoded.output) log += (log ? "\n" : "") + decoded.output;
-        resultError = decoded.error;
+        let decoded = decodeCodeModeImages(returned);
         this.sweepStagedChatAttachments();
-        for (let image of decoded.images) {
-          attachments.push(this.stageChatAttachment(image));
-        }
+        attachments = decoded.images.map(image => this.stageChatAttachment(image));
+        log = [log, ...decoded.notes].filter(line => line).join("\n");
       }
 
       if (error !== undefined) {
         log += `\n\nUncaught exception: ${error}`;
-      } else if (log === "" && attachments.length === 0) {
+      } else if (log === "") {
         log = "(function succeeded with no output)";
       }
 
-      return {output: log, ...(attachments.length > 0 && {attachments}),
-              ...((error ?? resultError) && {error: error ?? resultError})};
+      return {output: log, ...(attachments.length > 0 && {attachments})};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {

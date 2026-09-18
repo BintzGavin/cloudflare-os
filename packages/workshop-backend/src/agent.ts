@@ -1783,11 +1783,7 @@ async function runAgentPass(
             let toolOutput: {text: string, isError?: boolean};
             try {
               if (toolCall.error) {
-                toolOutput = {
-                  text: toolCall.toolName === "executeCode"
-                    ? toolCall.output || toolCall.error : toolCall.error,
-                  isError: true,
-                };
+                toolOutput = {text: `${toolCall.error}`, isError: true};
               } else switch (toolCall.toolName) {
                 // Note that if we get here, we know the tool succeeded originally, so for many
                 // branches below we can just return success unconditionally.
@@ -3208,14 +3204,10 @@ async function runAgentPass(
                 delta,
               }),
               worktreeTurnAccess);
-          let content = await codeModeImageContent(output.attachments,
-              handle.model.input.includes("image"), id => hooks.getChatAttachmentData(chatId, id));
-          if (output.attachments?.length && !handle.model.input.includes("image")) {
-            output.output += `\n[Images were omitted from the model request at capture time: ${author.id}.]`;
-          }
-          // Keep notes even for an error result: pi's barrier takes error text instead of details.
-          toolCallNotes.set(toolCallId, output);
-          return {content: [{type: "text" as const, text: output.output}, ...content], details: output};
+          let result = toolResult(output.output, output as Partial<AiToolCall>);
+          return {...result, content: [...result.content, ...await codeModeImageContent(
+              output.attachments, handle.model.input.includes("image"),
+              id => hooks.getChatAttachmentData(chatId, id))]};
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)
@@ -3544,8 +3536,6 @@ async function runAgentPass(
     // Replay already produces LLM-shaped messages; no custom message types exist.
     convertToLlm: (messages) => messages as Message[],
     toolExecution: "sequential",
-    afterToolCall: async ({toolCall, result}) =>
-      toolCall.name === "executeCode" && result.details?.error ? {isError: true} : undefined,
     maxTokens: maxOutputTokens,
     shouldStopAfterTurn: ({message, toolResults}) => {
       // The stop reasons that end the turn come first: a compaction reload must not resume work
