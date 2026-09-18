@@ -140,7 +140,7 @@ describe('ChatInterface action refresh', () => {
   })
 })
 
-it('opens a recorded code-result image and restores focus when its preview closes', async () => {
+it.each([false, true])('opens a recorded code-result image and restores focus (deferred: %s)', async deferred => {
   const originalUrl = URL
   const createUrl = vi.fn<(blob: Blob) => string>(() => 'blob:recorded-image')
   const revokeUrl = vi.fn<(url: string) => void>()
@@ -160,11 +160,14 @@ it('opens a recorded code-result image and restores focus when its preview close
       toolCalls: [{
         toolCallId: 'capture', toolName: 'executeCode', input: { code: 'return capture;' },
         output: 'Captured.', attachments: [{
-          id: 'image', mimeType: 'image/png', name: 'capture.png', size: image.length, content: image,
+          id: 'image', mimeType: 'image/png', name: 'capture.png', size: deferred ? 15 * 1024 * 1024 : image.length,
+          ...(deferred ? {} : {content: image}),
         }],
       }],
     }
+    const loadImage = vi.fn<(chatId: number, id: string) => Promise<Uint8Array>>(async () => image)
     Object.assign(server.overseer as object, {
+      getChatAttachmentContent: loadImage,
       listChats: async () => [{ id: 1, title: 'Images', started: new Date(), lastActive: new Date() }],
       getChatHistory: async () => ({ messages: [message] }),
     })
@@ -177,9 +180,11 @@ it('opens a recorded code-result image and restores focus when its preview close
     act(() => run!.click())
     const preview = document.querySelector<HTMLButtonElement>('[aria-label="Preview capture.png"]')
     expect(preview).not.toBeNull()
-    expect(preview!.querySelector('img')?.getAttribute('src')).toBe('blob:recorded-image')
+    expect(loadImage).not.toHaveBeenCalled()
+    expect(preview!.querySelector('img')?.getAttribute('src')).toBe(deferred ? undefined : 'blob:recorded-image')
     preview!.focus()
-    act(() => preview!.click())
+    await act(async () => preview!.click())
+    expect(loadImage.mock.calls).toEqual(deferred ? [[1, 'image']] : [])
     flushFrames()
     expect(document.querySelector('[role="dialog"] img')?.getAttribute('src')).toBe('blob:recorded-image')
     expect(document.activeElement?.getAttribute('aria-label')).toBe('Close preview')

@@ -1,6 +1,8 @@
 import { logRpcFailure } from "./rpcErrors";
 import {
   Fragment,
+  createContext,
+  useContext,
   isValidElement,
   memo,
   useState,
@@ -1366,6 +1368,8 @@ const ChatAttachmentThumbnail = memo(function ChatAttachmentThumbnail(
   );
 });
 
+const ChatImageLoaderContext = createContext<((id: string) => Promise<Uint8Array>) | null>(null);
+
 type ChatAttachmentGridProps = {
   attachments: ChatAttachmentRef[];
   onDownload?: AttachmentDownloadHandler;
@@ -1377,12 +1381,28 @@ const ChatAttachmentGrid = memo(function ChatAttachmentGrid(
     onDownload,
   }: ChatAttachmentGridProps,
 ) {
-  const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
-  const previewAttachment = previewAttachmentId === null
-    ? null
-    : attachments.find((attachment) => attachment.id === previewAttachmentId) ?? null;
-  const handlePreview = useCallback((id: string) => setPreviewAttachmentId(id), []);
-  const handleClose = useCallback(() => setPreviewAttachmentId(null), []);
+  const loadImage = useContext(ChatImageLoaderContext);
+  const [previewAttachment, setPreviewAttachment] = useState<ChatAttachmentRef | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const handlePreview = useCallback(async (id: string) => {
+    let attachment = attachments.find(attachment => attachment.id === id);
+    if (!attachment) return;
+    setError(false);
+    if (!attachment.content && attachment.mimeType.startsWith("image/") && loadImage) {
+      setLoading(true);
+      try {
+        attachment = {...attachment, content: await loadImage(id)};
+      } catch {
+        setError(true);
+        return;
+      } finally {
+        setLoading(false);
+      }
+    }
+    setPreviewAttachment(attachment);
+  }, [attachments, loadImage]);
+  const handleClose = useCallback(() => setPreviewAttachment(null), []);
 
   return (
     <>
@@ -1395,6 +1415,8 @@ const ChatAttachmentGrid = memo(function ChatAttachmentGrid(
           />
         ))}
       </div>
+      {loading && <p role="status" className="text-xs text-kumo-subtle">Loading image…</p>}
+      {error && <p role="alert" className="text-xs text-kumo-danger">Could not load the image. Try again.</p>}
       <AttachmentPreviewModal
         attachment={previewAttachment}
         onClose={handleClose}
@@ -3066,6 +3088,11 @@ function ChatInterface({
       toasts.add({ title: err?.message || "Failed to download attachment", variant: "error" });
     }
   }, [overseer, toasts]);
+
+  const loadChatImage = useCallback((id: string) => {
+    if (selectedChatId === null) return Promise.reject(new Error("No conversation selected."));
+    return overseer.getChatAttachmentContent(selectedChatId, id);
+  }, [overseer, selectedChatId]);
 
   const onSelectedChatProposedChangesChangeRef = useRef(onSelectedChatProposedChangesChange);
   onSelectedChatProposedChangesChangeRef.current = onSelectedChatProposedChangesChange;
@@ -5265,6 +5292,7 @@ function ChatInterface({
 
   // ─── main render ─────────────────────────────────────────────────────────────
   return (
+    <ChatImageLoaderContext value={loadChatImage}>
     <div
       className={`flex h-full bg-kumo-base ${sidebarMode ? "flex-row" : "flex-col"}`}
     >
@@ -6423,6 +6451,7 @@ function ChatInterface({
         onClose={() => setUsageModalOpen(false)}
       />
     </div>
+    </ChatImageLoaderContext>
   );
 }
 
