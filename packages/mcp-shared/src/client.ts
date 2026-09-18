@@ -250,6 +250,7 @@ function extractResponse(bodyText: string, id: number | string): JsonRpcResponse
 async function readSseResponse(
   response: Response,
   id: number | string,
+  maxBytes: number,
 ): Promise<{ parsed: JsonRpcResponse; bytes: number }> {
   if (!response.body) {
     throw new McpProtocolError("MCP server's event stream contained no response to the request.");
@@ -290,10 +291,10 @@ async function readSseResponse(
           "MCP server's event stream contained no response to the request.");
       }
       total += value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) {
+      if (total > maxBytes) {
         await reader.cancel().catch(() => undefined);
         throw new McpProtocolError(
-          `MCP server's event stream exceeded ${MAX_RESPONSE_BYTES} bytes.`);
+          `MCP server's event stream exceeded ${maxBytes} bytes.`);
       }
       buffered += decoder.decode(value, { stream: true });
       const parsed = consume();
@@ -482,11 +483,14 @@ export class McpClient {
     const sessionId = response.headers.get("Mcp-Session-Id");
     if (sessionId) this.sessionId = sessionId;
 
+    // The Workshop accepts 5 MiB of images per execution, which is 6.7 MiB in base64; the rest
+    // is room for text and JSON/SSE framing. Discovery and OAuth retain their smaller budget.
+    const maxBytes = method === "tools/call" ? 8 * 1024 * 1024 : MAX_RESPONSE_BYTES;
     const contentType = (response.headers.get("Content-Type") ?? "").toLowerCase();
     let parsed: JsonRpcResponse;
     let responseBytes: number;
     if (contentType.includes("text/event-stream")) {
-      const measured = await readSseResponse(response, id);
+      const measured = await readSseResponse(response, id, maxBytes);
       parsed = measured.parsed;
       responseBytes = measured.bytes;
     } else {
@@ -494,7 +498,7 @@ export class McpClient {
       // before it can be parsed. The catalog limits above bound what is kept, not what arrives.
       let bodyText: string;
       try {
-        bodyText = await readTextCapped(response);
+        bodyText = await readTextCapped(response, maxBytes);
       } catch (err) {
         throw new McpProtocolError(
           `MCP server's response to "${method}" was too large to read: ` +

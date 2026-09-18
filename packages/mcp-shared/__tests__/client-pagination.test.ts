@@ -490,7 +490,7 @@ describe("McpClient.listTools", () => {
     // The catalog caps bound what is *kept*; the body still has to be read whole before anything can
     // parse it, and a `tools/call` result is not bounded at all. A server answering one request with
     // an enormous body would exhaust the Worker before any of the limits above applied.
-    vi.stubGlobal("fetch", async () => new Response("x".repeat(2 * 1024 * 1024), {
+    vi.stubGlobal("fetch", async () => new Response("x".repeat(2 * 8 * 1024 * 1024), {
       status: 200, headers: { "Content-Type": "application/json" },
     }));
     const client = new McpClient("https://mcp.example.com/mcp", async () => null);
@@ -651,4 +651,16 @@ describe("HTTP error outcomes", () => {
     const err = await client.callTool("anything", {}).catch(caught => caught);
     expect(callMayHaveTakenEffect(err)).toBe(true);
   });
+});
+
+
+it.each(["application/json", "text/event-stream"])("accepts a 5 MiB tool image over %s", async contentType => {
+  const data = Buffer.alloc(5 * 1024 * 1024).toString("base64");
+  vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+    const {id} = JSON.parse(String(init?.body));
+    const json = JSON.stringify({jsonrpc: "2.0", id, result: {content: [{type: "image", mimeType: "image/png", data}]}});
+    return new Response(contentType === "application/json" ? json : `data: ${json}\n\n`, {headers: {"Content-Type": contentType}});
+  });
+  const client = new McpClient("https://mcp.example.com/mcp", async () => null);
+  expect((await client.callTool("capture", {})).content).toEqual([{type: "image", mimeType: "image/png", data}]);
 });

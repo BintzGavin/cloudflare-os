@@ -2,8 +2,11 @@ import { isTextLikeAttachmentMimeType } from "@gadgets/workshop-shared/api";
 import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
 
-// Bounds attachment storage and the bytes replayed into model requests.
-const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
+/** Bounds attachment storage and the bytes replayed into model requests. */
+export const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
+
+/** Maximum number of attachments in a message or one code execution's output. */
+export const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 
 const IMAGE_SIGNATURES = new Map<string, readonly (number | null)[]>([
   ["image/jpeg", [0xFF, 0xD8, 0xFF]],
@@ -71,6 +74,17 @@ export function assertChatAttachmentSupportedByProvider(
   throw new Error("Unsupported file type");
 }
 
+/** Throw if the bytes don't begin with the magic number for their declared type. */
+function assertChatAttachmentSignature(mimeType: string, content: Uint8Array): void {
+  let signature = CONTENT_SIGNATURES.get(mimeType);
+  if (!signature) return;
+  for (let [index, expected] of signature.entries()) {
+    if (expected !== null && content[index] !== expected) {
+      throw new Error("Chat attachment content does not match its MIME type.");
+    }
+  }
+}
+
 /** Normalize and validate attachment bytes before staging them in chat storage. */
 export function validateChatAttachmentUpload(
   attachment: ChatAttachmentUpload,
@@ -79,17 +93,22 @@ export function validateChatAttachmentUpload(
   attachment.name = sanitizeChatAttachmentName(attachment.name);
   attachment.mimeType = sanitizeChatAttachmentMimeType(attachment.mimeType);
   assertChatAttachmentSupportedByProvider(provider, attachment.mimeType, attachment.content.byteLength);
-
-  let signature = CONTENT_SIGNATURES.get(attachment.mimeType);
-  if (signature) {
-    for (let [index, expected] of signature.entries()) {
-      if (expected !== null && attachment.content[index] !== expected) {
-        throw new Error("Chat attachment content does not match its MIME type.");
-      }
-    }
-  }
-
+  assertChatAttachmentSignature(attachment.mimeType, attachment.content);
   return attachment;
+}
+
+/**
+ * Normalize and validate an image for the code-result path: the MIME must be an accepted image
+ * encoding and the bytes must match it. Returns the normalized MIME. Unlike a chat upload, the
+ * caller (decodeCodeModeImages) enforces its own, larger size budget, so no size check here.
+ */
+export function validateCodeImageAttachment(mimeType: string, content: Uint8Array): string {
+  mimeType = sanitizeChatAttachmentMimeType(mimeType);
+  if (!IMAGE_SIGNATURES.has(mimeType)) {
+    throw new Error("Unsupported image format; use PNG, JPEG, or WebP.");
+  }
+  assertChatAttachmentSignature(mimeType, content);
+  return mimeType;
 }
 
 /** Whether a MIME type is one of the image encodings Workshop accepts for chat attachments. */
