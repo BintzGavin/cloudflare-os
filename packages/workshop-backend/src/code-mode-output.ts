@@ -1,4 +1,4 @@
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { ChatAttachmentRef, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import {
   detectChatAttachmentImageMimeType, MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
@@ -67,4 +67,43 @@ export async function codeModeImageContent(
       return {type: "text", text: "[Image no longer available.]"};
     }
   }));
+}
+
+/**
+ * Decoded bytes of returned images one model request carries. History replays every stored
+ * image into every request, and compaction cannot bound them: it weighs tokens, which an image's
+ * byte size barely moves. A person attaching images is paced by the chat; an agent returning
+ * them is not, so only the latter are bounded. The limit comes from the consumers: AI Gateway
+ * keeps no log of a request over 10 MB, which the overseer reads for the cost, and Gemini rejects
+ * a request over 20 MB. 5 MiB of bytes is 6.7 MiB of base64, with room for text.
+ */
+export const MAX_MODEL_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function decodedBase64Length(data: string): number {
+  let padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  return Math.floor(data.length * 3 / 4) - padding;
+}
+
+/**
+ * Keep the newest returned images within MAX_MODEL_IMAGE_BYTES and replace the rest with a
+ * marker, as compaction does for summarized history. A message's own attachments are left alone.
+ * Mutates in place, so the dropped base64 is freed from the isolate rather than only left out of
+ * one request.
+ */
+export function pruneImageInput(messages: Message[]): void {
+  let remaining = MAX_MODEL_IMAGE_BYTES;
+  for (let message of messages.toReversed()) {
+    if (message.role !== "toolResult") continue;
+    for (let [index, part] of [...message.content.entries()].toReversed()) {
+      if (part.type !== "image") continue;
+      let bytes = decodedBase64Length(part.data);
+      if (bytes <= remaining) {
+        remaining -= bytes;
+      } else {
+        message.content[index] = {type: "text", text: `[image ${part.mimeType} no longer ` +
+            `shown: model input keeps the newest ${MAX_MODEL_IMAGE_BYTES / 1024 / 1024} MiB ` +
+            "of returned images.]"};
+      }
+    }
+  }
 }

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { codeModeImageContent, decodeCodeModeImages } from "../src/code-mode-output.js";
+import type { Message } from "@earendil-works/pi-ai";
+import {
+  codeModeImageContent, decodeCodeModeImages, MAX_MODEL_IMAGE_BYTES, pruneImageInput,
+} from "../src/code-mode-output.js";
 
 const PNG = Uint8Array.fromBase64(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
@@ -74,5 +77,59 @@ describe("image model input", () => {
     let missing = async () => { throw new Error("gone"); };
     expect(await codeModeImageContent([attachment], true, missing))
         .toEqual([{type: "text", text: "[Image no longer available.]"}]);
+  });
+});
+
+describe("model image budget", () => {
+  const image = (bytes: number) => {
+    let data = new Uint8Array(bytes);
+    data.set(PNG);
+    return {type: "image" as const, mimeType: "image/png", data: data.toBase64()};
+  };
+  const toolResult = (...content: Extract<Message, {role: "toolResult"}>["content"]): Message =>
+    ({role: "toolResult", toolCallId: "call", toolName: "executeCode", content, isError: false,
+      timestamp: 0});
+  const kinds = (messages: Message[]) => messages.map(message =>
+    typeof message.content === "string" ? [] : message.content.map(part => part.type));
+
+  it("leaves a request within the budget untouched", () => {
+    let messages = [toolResult(image(MIB)), toolResult(image(MIB), image(MIB))];
+    let before = structuredClone(messages);
+    pruneImageInput(messages);
+    expect(messages).toEqual(before);
+  });
+
+  it("keeps the newest returned images and marks the ones that no longer fit", () => {
+    let messages: Message[] = [
+      toolResult(image(2 * MIB)),
+      toolResult({type: "text", text: "Captured."}, image(2 * MIB), image(MIB), image(MIB)),
+    ];
+    // 1 + 1 + 2 MiB fit newest-first; the oldest 2 MiB does not.
+    pruneImageInput(messages);
+    expect(kinds(messages)).toEqual([["text"], ["text", "image", "image", "image"]]);
+    expect(messages[0].content[0]).toEqual({type: "text", text:
+        "[image image/png no longer shown: model input keeps the newest 5 MiB of returned images.]"});
+  });
+
+  it("leaves a message's own attachments alone, however large, and does not count them", () => {
+    let attached: Message = {role: "user", timestamp: 0,
+      content: [{type: "text", text: "Look."}, image(3 * MIB), image(3 * MIB)]};
+    let messages = [attached, toolResult(...Array.from({length: 5}, () => image(MIB)))];
+    let before = structuredClone(attached);
+    pruneImageInput(messages);
+    expect(attached).toEqual(before);
+    expect(kinds(messages)[1]).toEqual(["image", "image", "image", "image", "image"]);
+  });
+
+  it("counts decoded bytes exactly, so images that sum to the budget all fit", () => {
+    let messages = [toolResult(...Array.from({length: MAX_MODEL_IMAGE_BYTES / MIB}, () => image(MIB)))];
+    pruneImageInput(messages);
+    expect(kinds(messages)).toEqual([["image", "image", "image", "image", "image"]]);
+  });
+
+  it("never sends an image larger than the whole budget, and keeps older ones that fit", () => {
+    let messages = [toolResult(image(MIB)), toolResult(image(MAX_MODEL_IMAGE_BYTES + 1))];
+    pruneImageInput(messages);
+    expect(kinds(messages)).toEqual([["image"], ["text"]]);
   });
 });

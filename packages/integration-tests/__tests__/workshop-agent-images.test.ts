@@ -150,3 +150,34 @@ it("rejects a capability smuggled through the harness and still finishes the exe
     expect(call.attachments).toBeUndefined();
     expect(imageUrls(model.requests[1])).toEqual([]);
   }));
+
+// Each image is the largest the Workshop accepts, distinguishable by its last byte.
+const returnImages = (count: number, tag: number) => `export default async function() {
+  return Array.from({length: ${count}}, (_, i) => {
+    let bytes = new Uint8Array(1024 * 1024);
+    bytes.set(Uint8Array.fromBase64("${PNG}"));
+    bytes[bytes.length - 1] = ${tag} + i;
+    return bytes;
+  });
+}`;
+const lastBytes = (request: unknown) =>
+  imageUrls(request).map(url => Buffer.from(url.split(",")[1], "base64").at(-1));
+
+it("keeps only the newest images in model input, in the live turn and on replay", () =>
+  withAgent([
+    {toolCall: {id: "first-images", name: "executeCode", arguments: {code: returnImages(3, 10)}}},
+    {toolCall: {id: "second-images", name: "executeCode", arguments: {code: returnImages(3, 20)}}},
+    {text: "All captured."},
+    {text: "Only the newest five are still in view."},
+  ], async (session, model) => {
+    const result = await session.runTurn("Capture six images in two steps.");
+    expect(result.outcome).toEqual({status: "completed"});
+    expect(lastBytes(model.requests[1])).toEqual([10, 11, 12]);
+    // Six exceed the budget: the oldest leaves the live request...
+    expect(lastBytes(model.requests[2])).toEqual([11, 12, 20, 21, 22]);
+    expect(JSON.stringify(model.requests[2])).toContain("no longer shown");
+    // ...and the request rebuilt from stored history, while all six stay in the chat.
+    expect((await session.runTurn("What do you still see?")).outcome).toEqual({status: "completed"});
+    expect(lastBytes(model.requests[3])).toEqual([11, 12, 20, 21, 22]);
+    expect(executeCodeCalls(result.history).flatMap(call => call.attachments ?? [])).toHaveLength(6);
+  }));

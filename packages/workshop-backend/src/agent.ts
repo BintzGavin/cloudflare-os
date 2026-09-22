@@ -2,7 +2,7 @@ import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSp
 import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
-import { codeModeImageContent, type CodeModeOutput } from './code-mode-output';
+import { codeModeImageContent, pruneImageInput, type CodeModeOutput } from './code-mode-output';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
 import { createWorkshopLogger } from "./observability";
 import { Type } from "@earendil-works/pi-ai";
@@ -2086,6 +2086,10 @@ async function runAgentPass(
               isError: toolOutput.isError ?? false,
               timestamp: msgTimestamp,
             });
+            // Here as well as per request, so replaying a long history never holds every image.
+            if (toolCall.toolName === "executeCode" && toolCall.attachments) {
+              pruneImageInput(modelMessages);
+            }
 
             modelToolCalls.push({
               type: "toolCall",
@@ -3620,7 +3624,10 @@ async function runAgentPass(
   await runAgentLoopContinue(context, {
     model: handle.model,
     // Replay already produces LLM-shaped messages; no custom message types exist.
-    convertToLlm: (messages) => messages as Message[],
+    convertToLlm: (messages) => {
+      pruneImageInput(messages as Message[]);
+      return messages as Message[];
+    },
     toolExecution: "sequential",
     maxTokens: maxOutputTokens,
     shouldStopAfterTurn: ({message, toolResults}) => {
