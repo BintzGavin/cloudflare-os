@@ -184,3 +184,53 @@ it('fetches a large image on demand when its preview is opened', async () => {
     else Reflect.deleteProperty(HTMLElement.prototype, 'scrollTo')
   }
 })
+
+it('shows the images a code run returned and opens one in the preview', async () => {
+  const originalUrl = URL
+  const createUrl = vi.fn<(blob: Blob) => string>(() => 'blob:returned-image')
+  const revokeUrl = vi.fn<(url: string) => void>()
+  const scrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTo')
+  Object.defineProperty(HTMLElement.prototype, 'scrollTo', { configurable: true, value: vi.fn<() => void>() })
+  vi.stubGlobal('URL', class extends originalUrl {
+    static createObjectURL = createUrl
+    static revokeObjectURL = revokeUrl
+  })
+  try {
+    const server = makeOverseer()
+    withChatApi(server)
+    const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    const message: AiChatMessage = {
+      type: 'message', chatId: 1, sequence: 0, timestamp: new Date(),
+      author: { type: 'agent', id: 'model', name: 'Model' }, message: '',
+      toolCalls: [{
+        toolCallId: 'capture', toolName: 'executeCode', input: { code: 'return capture;' },
+        output: 'Captured.',
+        attachments: [{ id: 'image', mimeType: 'image/png', size: image.length, content: image }],
+      }],
+    }
+    Object.assign(server.overseer as object, {
+      listChats: async () => [{ id: 1, title: 'Images', started: new Date(), lastActive: new Date() }],
+      getChatHistory: async () => ({ messages: [message] }),
+    })
+    await renderChat(server.overseer, 1)
+    await server.resolveSubscription()
+    await server.resolvePendingQuery({ entries: [] })
+    flushFrames()
+    const run = [...document.querySelectorAll('button')].find(button => button.textContent === 'Ran code return capture;')
+    expect(run).toBeDefined()
+    act(() => run!.click())
+    const preview = document.querySelector<HTMLButtonElement>('[aria-label="Preview attached file"]')
+    expect(preview).not.toBeNull()
+    expect(preview!.querySelector('img')?.getAttribute('src')).toBe('blob:returned-image')
+    act(() => preview!.click())
+    flushFrames()
+    expect(document.querySelector('[role="dialog"] img')?.getAttribute('src')).toBe('blob:returned-image')
+    expect(createUrl.mock.calls[0][0]).toMatchObject({ size: image.length, type: 'image/png' })
+    testRoot.unmount()
+    expect(revokeUrl).toHaveBeenCalled()
+  } finally {
+    vi.stubGlobal('URL', originalUrl)
+    if (scrollTo) Object.defineProperty(HTMLElement.prototype, 'scrollTo', scrollTo)
+    else Reflect.deleteProperty(HTMLElement.prototype, 'scrollTo')
+  }
+})
