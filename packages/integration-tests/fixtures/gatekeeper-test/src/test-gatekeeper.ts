@@ -44,10 +44,15 @@ const TYPES_CODE = `
 /** A stand-in resource whose reads and writes are deterministic and audited. */
 interface TestThing {
   readValue(): Promise<number>;
+  readImage(): Promise<Blob>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
 }
 `;
+
+// A 1x1 PNG, the smallest image the Workshop accepts as an attachment.
+const PNG_1X1 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 // A 1x1 transparent GIF, so nothing here reaches for a network asset.
 const AVATAR = {
@@ -306,6 +311,8 @@ export interface TestSession {
    * `ownerInvitesOnly`.
    */
   readValue(restricted?: boolean, ownerInvitesOnly?: boolean): Promise<number>;
+  /** A 1x1 PNG, for tests that return an image from executeCode. */
+  readImage(): Promise<Blob>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
 }
@@ -330,6 +337,14 @@ class TestSessionTarget extends RpcTarget implements TestSession {
       ...(ownerInvitesOnly ? { ownerInvitesOnly: true } : {}),
     });
     return 42;
+  }
+
+  async readImage(): Promise<Blob> {
+    await this.approvalQueue.authorizeObservation({
+      title: "Read the test image",
+      description: "Read the deterministic image exposed by the integration-test gatekeeper.",
+    });
+    return new Blob([Uint8Array.from(atob(PNG_1X1), c => c.charCodeAt(0))], {type: "image/png"});
   }
 
   async writeValue(value: number): Promise<number> {

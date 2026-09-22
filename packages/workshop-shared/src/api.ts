@@ -3393,6 +3393,12 @@ export type AiToolCall = {
 
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
+
+  /**
+   * Images the code returned for the model to see. They are chat attachments committed with the
+   * message, so image bytes are inlined for clients as they are for a message's own attachments.
+   */
+  attachments?: ChatAttachmentRef[];
 } | {
   /**
    * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer

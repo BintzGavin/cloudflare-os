@@ -57,8 +57,10 @@ import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
+  MAX_CHAT_ATTACHMENT_TOTAL_BYTES, MAX_CHAT_ATTACHMENTS_PER_MESSAGE,
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
+import { decodeCodeModeImages, type CodeModeOutput } from "./code-mode-output";
 import { renderGadgetInBrowser } from "./browser-export";
 import {
   defaultExportFormats,
@@ -97,6 +99,13 @@ export default class extends WorkerEntrypoint {
       }
     }
     let result = await agent(self, env, this.ctx);
+    // Images the agent returns to look at travel back over RPC as Blobs (raw bytes wrapped in
+    // one) instead of being logged. The overseer enforces every limit: this code shares an
+    // isolate with the agent's, so a check here would protect nothing.
+    let images = [result].flat().flatMap(value =>
+        value instanceof Blob ? [value]
+        : value instanceof ArrayBuffer || ArrayBuffer.isView(value) ? [new Blob([value])] : []);
+    if (images.length > 0) return images;
     if (result !== undefined) console.log("Return value:", result);
   }
 }
@@ -169,7 +178,10 @@ let RESTORE_FORGER_WORKER: WorkerLoaderWorkerCode = {
 
 interface CodeModeEntrypoint extends WorkerEntrypoint {
   verify(): void;
-  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+  // The images the code returned, if any. Like every object an RPC returns, the array carries a
+  // disposer for whatever stubs it holds.
+  run(self?: unknown, restoreForger?: NativeRpcStub<RestoreForgerImpl>)
+      : Promise<(Blob[] & Disposable) | undefined>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -619,8 +631,6 @@ function validateBlueprintScreenshotUpload(screenshot: BlueprintScreenshotUpload
   return screenshot;
 }
 
-const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
-const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
 // A storage value is capped at 2 MB, so attachment bytes are stored in chunks of this size.
 const CHAT_ATTACHMENT_CHUNK_BYTES = 1024 * 1024;
 // Staged attachments (not associated with chat) older than this may be deleted when the gadget next stages an attachment.
@@ -5800,8 +5810,8 @@ class OverseerImpl implements AgentHooks {
       let {update: _, ...rest} = msg as AiChatMessage & {update?: Uint8Array};
       msg = rest as AiChatMessage;
     }
-    if (msg.type !== "message" || !msg.attachments?.length) return msg;
-    let attachments = msg.attachments.map((a) => {
+    if (msg.type !== "message") return msg;
+    let hydrate = (a: ChatAttachmentRef) => {
       if (!isAllowedChatAttachmentImageMimeType(a.mimeType)) {
         return a;
       }
@@ -5811,8 +5821,13 @@ class OverseerImpl implements AgentHooks {
         return a;
       }
       return {...a, content: content.data};
-    });
-    return {...msg, attachments};
+    };
+    return {...msg,
+      ...(msg.attachments && {attachments: msg.attachments.map(hydrate)}),
+      ...(msg.toolCalls && {toolCalls: msg.toolCalls.map(call =>
+        call.toolName === "executeCode" && call.attachments
+          ? {...call, attachments: call.attachments.map(hydrate)} : call)}),
+    };
   }
 
   // Look up the attachments that the client wants to send.
@@ -8576,6 +8591,16 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      // Images an executeCode call returned commit with the message that records them, in the
+      // same synchronous step. The record holds their references only; the bytes stay in storage.
+      if (msg.type === "message" && msg.toolCalls) {
+        msg.toolCalls = msg.toolCalls.map(call => {
+          if (call.toolName !== "executeCode" || !call.attachments) return call;
+          this.commitChatAttachments(chatId, call.attachments);
+          return {...call, attachments: call.attachments.map(({content: _, ...ref}) => ref)};
+        });
+      }
+
       this.storage.chats.put({
         chatId,
         sequence,
@@ -8677,7 +8702,7 @@ class OverseerImpl implements AgentHooks {
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
                         worktreeTurn?: WorktreeTurnAccess)
-      : Promise<string> {
+      : Promise<CodeModeOutput> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     let executionId: string = bytes.toBase64();
@@ -8740,10 +8765,17 @@ class OverseerImpl implements AgentHooks {
       }});
 
       let error: string | undefined;
+      let images: ChatAttachmentUpload[] = [];
+      let notes: string[] = [];
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        using returned =
+            await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        // Built by code sharing the agent's isolate, so the array may hold stubs rather than
+        // Blobs. It is disposed here, before the tail is awaited: a live stub would hold the
+        // execution open.
+        if (returned !== undefined) ({images, notes} = await decodeCodeModeImages(returned));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -8768,13 +8800,16 @@ class OverseerImpl implements AgentHooks {
         }).join(" ");
       }).join("\n");
 
+      let attachments = images.map(image => this.stageChatAttachment(image));
+      log = [log, ...notes].filter(line => line).join("\n");
+
       if (error !== undefined) {
         log += `\n\nUncaught exception: ${error}`;
       } else if (log === "") {
         log = "(function succeeded with no output)";
       }
 
-      return log;
+      return attachments.length > 0 ? {output: log, attachments} : {output: log};
     } finally {
       // Guarded by executionId so this cleanup can never clobber a newer registration.
       if (this.#activeWorktreeTurns.get(chatId)?.executionId === executionId) {
@@ -11872,7 +11907,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.ctx.storage.transactionSync(() => {
       for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
         if (msg.type === "message") {
-          for (let attachment of msg.attachments ?? []) {
+          let returned = msg.toolCalls?.flatMap(call =>
+              call.toolName === "executeCode" ? call.attachments ?? [] : []) ?? [];
+          for (let attachment of [...msg.attachments ?? [], ...returned]) {
             let content = this.impl.storage.chatAttachmentContent.get(attachment.id);
             if (content?.state.type === "committed" && content.state.chatId === chatId) {
               this.impl.deleteChatAttachmentContent(attachment.id);

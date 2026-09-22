@@ -3,13 +3,18 @@ import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadg
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
 
 /**
- * Bytes one attachment may hold: the same as a message's attachments may hold together (the
- * overseer's MAX_CHAT_ATTACHMENT_TOTAL_BYTES), so one attachment may use a message's whole
- * allowance. The bound comes from what a model request carries: history replays every image into
+ * Bytes one attachment may hold: the same as a message's attachments may hold together
+ * (MAX_CHAT_ATTACHMENT_TOTAL_BYTES), so one attachment may use a message's whole allowance. The bound comes from what a model request carries: history replays every image into
  * every request, the Claude API takes 10 MB of base64 per image and Gemini 20 MB per request, and
  * AI Gateway keeps no log of a request over 10 MB, which the overseer reads for its cost.
  */
 export const MAX_CHAT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+/** Bytes a message's attachments, or one code execution's images, may hold together. */
+export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = MAX_CHAT_ATTACHMENT_BYTES;
+
+/** Attachments one message, or one code execution's result, may carry. */
+export const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 
 const IMAGE_SIGNATURES = new Map<string, readonly (number | null)[]>([
   ["image/jpeg", [0xFF, 0xD8, 0xFF]],
@@ -45,6 +50,10 @@ const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   cloudflare: isTextOrImageMime,
   ollama: isTextOrImageMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
+
+function matchesSignature(content: Uint8Array, signature: readonly (number | null)[]): boolean {
+  return signature.every((expected, index) => expected === null || content[index] === expected);
+}
 
 function sanitizeChatAttachmentMimeType(mimeType: string | undefined): string {
   if (!mimeType || /[\r\n]/.test(mimeType)) return "application/octet-stream";
@@ -87,15 +96,19 @@ export function validateChatAttachmentUpload(
   assertChatAttachmentSupportedByProvider(provider, attachment.mimeType, attachment.content.byteLength);
 
   let signature = CONTENT_SIGNATURES.get(attachment.mimeType);
-  if (signature) {
-    for (let [index, expected] of signature.entries()) {
-      if (expected !== null && attachment.content[index] !== expected) {
-        throw new Error("Chat attachment content does not match its MIME type.");
-      }
-    }
+  if (signature && !matchesSignature(attachment.content, signature)) {
+    throw new Error("Chat attachment content does not match its MIME type.");
   }
 
   return attachment;
+}
+
+/** The accepted image encoding whose magic number the bytes begin with, if any. */
+export function detectChatAttachmentImageMimeType(content: Uint8Array): string | undefined {
+  for (let [mimeType, signature] of IMAGE_SIGNATURES) {
+    if (matchesSignature(content, signature)) return mimeType;
+  }
+  return undefined;
 }
 
 /** Whether a MIME type is one of the image encodings Workshop accepts for chat attachments. */
