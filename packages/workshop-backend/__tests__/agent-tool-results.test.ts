@@ -1,5 +1,5 @@
 import {describe, expect, it} from "vitest";
-import {MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent";
+import {cutToolOutput, MAX_TOOL_RESULT_CHARS, readFileWindow} from "../src/agent";
 import {formatGrep, matchLines, scanWorkpieceForGrep, type GrepScan} from "../src/grep";
 
 describe("grep", () => {
@@ -115,4 +115,11 @@ describe("readFile windows", () => {
     expect(note.last).toBeLessThan(bigLines);
     expect(note.body).toBe(Array.from({length: note.last - 4}, () => bigLine).join("\n"));
   });
+});
+
+it("cuts executeCode output at the cap and says how much is missing", () => {
+  expect(cutToolOutput("short")).toBe("short");
+  let cut = cutToolOutput("0,".repeat(65536));
+  expect(cut.slice(0, MAX_TOOL_RESULT_CHARS)).toBe("0,".repeat(MAX_TOOL_RESULT_CHARS / 2));
+  expect(cut.slice(MAX_TOOL_RESULT_CHARS)).toBe(`\n[output cut: ${131072 - MAX_TOOL_RESULT_CHARS} more characters]`);
 });
