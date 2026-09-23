@@ -621,6 +621,8 @@ function validateBlueprintScreenshotUpload(screenshot: BlueprintScreenshotUpload
 
 const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 5;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 5 * 1024 * 1024;
+// A storage value is capped at 2 MB, so attachment bytes are stored in chunks of this size.
+const CHAT_ATTACHMENT_CHUNK_BYTES = 1024 * 1024;
 // Staged attachments (not associated with chat) older than this may be deleted when the gadget next stages an attachment.
 const MAX_STAGED_CHAT_ATTACHMENT_AGE_MS = 24 * 60 * 60 * 1000;
 const CHAT_ATTACHMENT_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -632,7 +634,10 @@ function validateChatAttachmentId(id: string): string {
 
 type ChatAttachmentContentRecord = {
   fileId: string;
+  // The first CHAT_ATTACHMENT_CHUNK_BYTES; any rest is in `chatAttachmentChunks`, keyed by offset.
   data: Uint8Array;
+  // Total bytes, present only when there are further chunks (so older records need no migration).
+  size?: number;
   state:
     | {
         type: "staged";
@@ -1432,6 +1437,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
           },
         },
       }),
+
+      // The bytes of an attachment beyond its record's first chunk, keyed `${fileId}:${offset}`.
+      chatAttachmentChunks: collection<{key: string; data: Uint8Array}>()({primaryKey: "key"}),
 
       // Non-owner collaborators who have configured their gatekeeper accounts and passed all
       // `addObserver` checks. See `ObserverRecord`. The secondary index lets the forward-exclusion
@@ -5725,11 +5733,65 @@ class OverseerImpl implements AgentHooks {
     if (!content || content.state.type !== "committed" || content.state.chatId !== chatId) {
       throw new Error("Chat attachment not found.");
     }
-    return content.data;
+    return this.#readChatAttachmentData(content);
   }
 
-  // Prepare a stored chat message for delivery to a client: inline image attachment bytes
-  // (non-image attachments are fetched on demand via getChatAttachmentContent()), strip the
+  // Stage validated attachment bytes until the message carrying them commits (see
+  // commitChatAttachments). The reference inlines the bytes, for their first delivery.
+  stageChatAttachment(attachment: ChatAttachmentUpload): ChatAttachmentRef {
+    this.sweepStagedChatAttachments();
+    let id = crypto.randomUUID();
+    let {mimeType, name} = attachment;
+    let content = new Uint8Array(attachment.content);
+    // Sliced rather than viewed: a view stores its whole underlying buffer.
+    this.ctx.storage.transactionSync(() => {
+      this.storage.chatAttachmentContent.put({
+        fileId: id,
+        data: content.slice(0, CHAT_ATTACHMENT_CHUNK_BYTES),
+        ...(content.byteLength > CHAT_ATTACHMENT_CHUNK_BYTES && {size: content.byteLength}),
+        state: {type: "staged", uploadedAt: Date.now(), mimeType, name},
+      });
+      for (let offset = CHAT_ATTACHMENT_CHUNK_BYTES; offset < content.byteLength;
+           offset += CHAT_ATTACHMENT_CHUNK_BYTES) {
+        this.storage.chatAttachmentChunks.put({
+          key: `${id}:${offset}`, data: content.slice(offset, offset + CHAT_ATTACHMENT_CHUNK_BYTES),
+        });
+      }
+    });
+    return {id, mimeType, name, size: content.byteLength, content};
+  }
+
+  #chatAttachmentSize(record: ChatAttachmentContentRecord): number {
+    return record.size ?? record.data.byteLength;
+  }
+
+  #readChatAttachmentData(record: ChatAttachmentContentRecord): Uint8Array {
+    if (record.size === undefined) return record.data;
+    let bytes = new Uint8Array(record.size);
+    bytes.set(record.data);
+    for (let offset = CHAT_ATTACHMENT_CHUNK_BYTES; offset < record.size;
+         offset += CHAT_ATTACHMENT_CHUNK_BYTES) {
+      let chunk = this.storage.chatAttachmentChunks.get(`${record.fileId}:${offset}`);
+      if (chunk?.data.byteLength !== Math.min(CHAT_ATTACHMENT_CHUNK_BYTES, record.size - offset)) {
+        throw new Error("Chat attachment content is incomplete.");
+      }
+      bytes.set(chunk.data, offset);
+    }
+    return bytes;
+  }
+
+  deleteChatAttachmentContent(id: string): void {
+    this.ctx.storage.transactionSync(() => {
+      for (let chunk of this.storage.chatAttachmentChunks.list({prefix: `${id}:`})) {
+        this.storage.chatAttachmentChunks.delete(chunk.key);
+      }
+      this.storage.chatAttachmentContent.delete(id);
+    });
+  }
+
+  // Prepare a stored chat message for delivery to a client: inline the bytes of image attachments
+  // that fit one chunk (larger images, like non-image attachments, are fetched on demand via
+  // getChatAttachmentContent(), rather than weighing down every page of history), strip the
   // retired Yjs payload from pre-conversion "changes" messages -- it is kept on disk as
   // rollback insurance (see git-migration.ts) but nothing can apply it, so it must not ship as
   // dead weight on the wire (it is not part of the message's API type).
@@ -5744,7 +5806,10 @@ class OverseerImpl implements AgentHooks {
         return a;
       }
       let content = this.storage.chatAttachmentContent.get(a.id);
-      if (!content) return a;
+      if (content?.state.type !== "committed" || content.state.chatId !== msg.chatId ||
+          content.size !== undefined) {
+        return a;
+      }
       return {...a, content: content.data};
     });
     return {...msg, attachments};
@@ -5774,13 +5839,14 @@ class OverseerImpl implements AgentHooks {
       if (!content || content.state.type !== "staged") {
         throw new Error("Chat attachment not found.");
       }
-      assertChatAttachmentSupportedByProvider(provider, content.state.mimeType, content.data.byteLength);
-      total += content.data.byteLength;
+      let size = this.#chatAttachmentSize(content);
+      assertChatAttachmentSupportedByProvider(provider, content.state.mimeType, size);
+      total += size;
       result.push({
         id,
         mimeType: content.state.mimeType,
         name: content.state.name,
-        size: content.data.byteLength,
+        size,
       });
     }
     if (total > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
@@ -5796,11 +5862,8 @@ class OverseerImpl implements AgentHooks {
       if (!content || content.state.type !== "staged") {
         throw new Error("Chat attachment is no longer available.");
       }
-      this.storage.chatAttachmentContent.put({
-        fileId: id,
-        data: content.data,
-        state: {type: "committed", chatId},
-      });
+      // Only the record's ownership changes; its chunks stay where they are.
+      this.storage.chatAttachmentContent.put({...content, state: {type: "committed", chatId}});
     }
   }
 
@@ -5808,7 +5871,7 @@ class OverseerImpl implements AgentHooks {
     let cutoff = Date.now() - MAX_STAGED_CHAT_ATTACHMENT_AGE_MS;
     this.ctx.storage.transactionSync(() => {
       for (let content of Array.from(this.storage.chatAttachmentContent.stagedByUploadedAt.list({end: cutoff}))) {
-        this.storage.chatAttachmentContent.delete(content.fileId);
+        this.deleteChatAttachmentContent(content.fileId);
       }
     });
   }
@@ -11563,38 +11626,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       attachment,
       provider,
     );
-
-    this.impl.sweepStagedChatAttachments();
-
-    let id = crypto.randomUUID();
-    this.impl.storage.chatAttachmentContent.put({
-      fileId: id,
-      data: new Uint8Array(attachment.content),
-      state: {
-        type: "staged",
-        uploadedAt: Date.now(),
-        mimeType: attachment.mimeType,
-        name: attachment.name,
-      },
-    });
-    return {id};
+    return {id: this.impl.stageChatAttachment(attachment).id};
   }
 
   // Fetch the bytes of a committed chat attachment over the authenticated RPC connection. The
   // caller already has its canonical metadata from the ChatAttachmentRef in the message.
   async getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array> {
-    let content = this.impl.storage.chatAttachmentContent.get(validateChatAttachmentId(id));
-    if (!content || content.state.type !== "committed" || content.state.chatId !== chatId) {
-      throw new Error("Chat attachment not found.");
-    }
-    return content.data;
+    return this.impl.getChatAttachmentData(chatId, id);
   }
 
   async deleteChatAttachment(id: string): Promise<void> {
     id = validateChatAttachmentId(id);
     let content = this.impl.storage.chatAttachmentContent.get(id);
     if (content?.state.type === "staged") {
-      this.impl.storage.chatAttachmentContent.delete(id);
+      this.impl.deleteChatAttachmentContent(id);
     }
   }
 
@@ -11830,7 +11875,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           for (let attachment of msg.attachments ?? []) {
             let content = this.impl.storage.chatAttachmentContent.get(attachment.id);
             if (content?.state.type === "committed" && content.state.chatId === chatId) {
-              this.impl.storage.chatAttachmentContent.delete(attachment.id);
+              this.impl.deleteChatAttachmentContent(attachment.id);
             }
           }
         }

@@ -2,8 +2,14 @@ import { isTextLikeAttachmentMimeType } from "@gadgets/workshop-shared/api";
 import type { AiModelConfig, AiModelProvider, ChatAttachmentUpload } from "@gadgets/workshop-shared/api";
 import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
 
-// Bounds attachment storage and the bytes replayed into model requests.
-const MAX_CHAT_ATTACHMENT_BYTES = 1024 * 1024;
+/**
+ * Bytes one attachment may hold: the same as a message's attachments may hold together (the
+ * overseer's MAX_CHAT_ATTACHMENT_TOTAL_BYTES), so one attachment may use a message's whole
+ * allowance. The bound comes from what a model request carries: history replays every image into
+ * every request, the Claude API takes 10 MB of base64 per image and Gemini 20 MB per request, and
+ * AI Gateway keeps no log of a request over 10 MB, which the overseer reads for its cost.
+ */
+export const MAX_CHAT_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 const IMAGE_SIGNATURES = new Map<string, readonly (number | null)[]>([
   ["image/jpeg", [0xFF, 0xD8, 0xFF]],
