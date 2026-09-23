@@ -2185,8 +2185,8 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Fetch the bytes of a committed chat attachment over RPC. The canonical metadata is already
-   * present in the message's ChatAttachmentRef. Images are inlined there, so this is normally used
-   * only to download non-image attachments on demand.
+   * present in the message's ChatAttachmentRef, and small images are inlined there, so this is
+   * used to fetch larger images and non-image attachments on demand.
    */
   getChatAttachmentContent(chatId: number, id: string): Promise<Uint8Array>;
 
@@ -3178,16 +3178,16 @@ export type ChatAttachmentHandle = {
 /**
  * Attachment metadata returned to clients.
  *
- * For image attachments, `content` carries the full image bytes inline so the client can render
- * them in the chat without an extra round trip. For other attachments, fetch the bytes on demand
- * via `Overseer.getChatAttachmentContent()`.
+ * For image attachments of up to 1 MiB, `content` carries the image bytes inline so the client can
+ * render them in the chat without an extra round trip. For larger images and other attachments,
+ * fetch the bytes on demand via `Overseer.getChatAttachmentContent()`.
  */
 export type ChatAttachmentRef = ChatAttachmentHandle & {
   mimeType: string;
   name?: string;
   size: number;
 
-  /** Inlined bytes for small image attachments. Present only for images. */
+  /** Inlined bytes for image attachments of up to 1 MiB. Present only for such images. */
   content?: Uint8Array;
 };
 
@@ -3393,6 +3393,12 @@ export type AiToolCall = {
 
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
+
+  /**
+   * Images the code returned for the model to see. They are chat attachments committed with the
+   * message, so image bytes are inlined for clients as they are for a message's own attachments.
+   */
+  attachments?: ChatAttachmentRef[];
 } | {
   /**
    * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer

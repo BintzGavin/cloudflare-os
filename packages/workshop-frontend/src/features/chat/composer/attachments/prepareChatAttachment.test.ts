@@ -24,7 +24,7 @@ describe("prepareChatAttachment", () => {
     );
 
     await expect(prepareChatAttachment(file)).rejects.toThrow(
-      "Attachments must be 1.0 MB or smaller.",
+      "Attachments must be 5.0 MB or smaller.",
     );
   });
 });

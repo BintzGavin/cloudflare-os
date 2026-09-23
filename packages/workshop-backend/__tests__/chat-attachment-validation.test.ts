@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertChatAttachmentSupportedByProvider,
   isAllowedChatAttachmentImageMimeType,
+  MAX_CHAT_ATTACHMENT_BYTES,
   validateChatAttachmentUpload,
 } from "../src/chat-attachment-validation.js";
 
@@ -36,7 +37,7 @@ describe("assertChatAttachmentSupportedByProvider", () => {
   });
 
   it("enforces the per-file byte limit", () => {
-    expect(() => assertChatAttachmentSupportedByProvider(undefined, "text/plain", 1024 * 1024 + 1))
+    expect(() => assertChatAttachmentSupportedByProvider(undefined, "text/plain", MAX_CHAT_ATTACHMENT_BYTES + 1))
       .toThrow("Chat attachment is too large.");
   });
 });
