@@ -70,10 +70,16 @@ export const STEP_CHANGE_BUDGET = 1536 * 1024;
  * results fit inside the compaction headroom of the smallest supported window. Each tool that can
  * produce more decides for itself how to stay under it in a way the model can read -- readFile
  * returns a window of whole lines with a continuation note, grep drops whole matches and says how
- * many, webFetch cuts its body and says so in the frontmatter -- rather than any tool's output
- * being spliced blindly. Tools not listed are small by construction.
+ * many, webFetch and executeCode cut their text and say so -- rather than any tool's output being
+ * spliced blindly. Tools not listed are small by construction.
  */
 export const MAX_TOOL_RESULT_CHARS = 32 * 1024;
+
+/** Cut console output at MAX_TOOL_RESULT_CHARS, saying how much is missing. */
+export function cutToolOutput(text: string): string {
+  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
+  return `${text.slice(0, MAX_TOOL_RESULT_CHARS)}\n[output cut: ${text.length - MAX_TOOL_RESULT_CHARS} more characters]`;
+}
 
 /**
  * One buffered agent tool edit: an entry of the step buffer, which the step's persistence
@@ -1058,7 +1064,7 @@ NOTE: You do NOT need this tool to use a resource yourself with \`executeCode\` 
 `.trim();
 
 let EXECUTE_CODE_TOOL_DESCRIPTION = `
-Executes one-off JavaScript code, returning the output it logs to the console. The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
+Executes one-off JavaScript code, returning the output it logs to the console (cut off past about 32K characters, with a note saying how much was dropped). The code runs in a sandbox where it cannot talk to the internet, except through the bindings in its 'env' object; fetch() will not work. Otherwise, the code can call any built-in APIs available in Cloudflare Workers.
 
 The 'env' object contains this chat's named bindings:
 * An entry for each Gadget in the workspace, under the name given in the system prompt's gadget list (or the name you passed to \`createGadget\`): an RPC stub pointing at the Gadget's server-side Durable Object. If the user asks you to interact with a Gadget directly, or asks if you can "see" it, use this stub (read the Gadget's server code to learn what RPC methods it exposes).

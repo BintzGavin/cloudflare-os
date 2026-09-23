@@ -30,7 +30,7 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
+import { AgentGadgetInfo, AgentHooks, AiChatAgentContext, CHAT_CHANGE_MESSAGE_BUDGET, ChatBindingEntry, SeedBindingInfo, cutToolOutput, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type CompactionCheckpoint, type StoredAssistantMessage, type WorktreeTurnAccess } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
@@ -8711,6 +8711,9 @@ class OverseerImpl implements AgentHooks {
           return typeof part === "string" ? part : JSON.stringify(part)
         }).join(" ");
       }).join("\n");
+
+      // Cut before the exception is appended, so a flood of output never hides the error.
+      log = cutToolOutput(log);
 
       if (error !== undefined) {
         log += `\n\nUncaught exception: ${error}`;
