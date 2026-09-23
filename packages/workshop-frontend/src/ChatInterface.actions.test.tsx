@@ -40,7 +40,7 @@ vi.mock('./AuthContext', () => {
   }
 })
 
-import { entry, makeOverseer, makeTestRoot } from './action-test-harness'
+import { entry, flushFrames, makeOverseer, makeTestRoot } from './action-test-harness'
 import ChatInterface from './ChatInterface'
 import { linkActionLog } from './useActions'
 
@@ -74,12 +74,12 @@ function withChatApi(
   }
 }
 
-function renderChat(overseer: RpcStub<Overseer>) {
+function renderChat(overseer: RpcStub<Overseer>, selectedChatId: number | null = null) {
   return testRoot.render(
     <ChatInterface
       workspaceId="workspace"
       overseer={overseer}
-      selectedChatId={null}
+      selectedChatId={selectedChatId}
       onNavigateToChat={() => {}}
       pendingConsoleLogCount={0}
       consoleLogPreview=""
@@ -138,4 +138,49 @@ describe('ChatInterface action refresh', () => {
     await second.resolvePendingQuery({ entries: [entry(1)] })
     expect(secondChat.getChatMessage).not.toHaveBeenCalled()
   })
+})
+
+it('fetches a large image on demand when its preview is opened', async () => {
+  const originalUrl = URL
+  const createUrl = vi.fn<(blob: Blob) => string>(() => 'blob:large-image')
+  const scrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTo')
+  Object.defineProperty(HTMLElement.prototype, 'scrollTo', { configurable: true, value: vi.fn<() => void>() })
+  vi.stubGlobal('URL', class extends originalUrl {
+    static createObjectURL = createUrl
+    static revokeObjectURL = vi.fn<(url: string) => void>()
+  })
+  try {
+    const server = makeOverseer()
+    withChatApi(server)
+    const image = new Uint8Array([0xff, 0xd8, 0xff])
+    const message: AiChatMessage = {
+      type: 'message', chatId: 1, sequence: 0, timestamp: new Date(),
+      author: { type: 'user', id: 'me', name: 'Me' }, message: 'Look at this.',
+      // Over the inline size, so it arrives without its bytes.
+      attachments: [{ id: 'photo', mimeType: 'image/jpeg', name: 'photo.jpg', size: 3 * 1024 * 1024 }],
+    }
+    const loadImage = vi.fn<(chatId: number, id: string) => Promise<Uint8Array>>(async () => image)
+    Object.assign(server.overseer as object, {
+      getChatAttachmentContent: loadImage,
+      listChats: async () => [{ id: 1, title: 'Photos', started: new Date(), lastActive: new Date() }],
+      getChatHistory: async () => ({ messages: [message] }),
+    })
+    await renderChat(server.overseer, 1)
+    await server.resolveSubscription()
+    await server.resolvePendingQuery({ entries: [] })
+    flushFrames()
+    const preview = document.querySelector<HTMLButtonElement>('[aria-label="Preview photo.jpg"]')
+    expect(preview).not.toBeNull()
+    expect(preview!.querySelector('img')).toBeNull()
+    expect(preview!.textContent).toContain('photo.jpg')
+    await act(async () => preview!.click())
+    expect(loadImage).toHaveBeenCalledExactlyOnceWith(1, 'photo')
+    flushFrames()
+    expect(document.querySelector('[role="dialog"] img')?.getAttribute('src')).toBe('blob:large-image')
+    expect(createUrl.mock.calls[0][0]).toMatchObject({ size: image.length, type: 'image/jpeg' })
+  } finally {
+    vi.stubGlobal('URL', originalUrl)
+    if (scrollTo) Object.defineProperty(HTMLElement.prototype, 'scrollTo', scrollTo)
+    else Reflect.deleteProperty(HTMLElement.prototype, 'scrollTo')
+  }
 })

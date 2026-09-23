@@ -1,8 +1,10 @@
 import { logRpcFailure } from "./rpcErrors";
 import {
   Fragment,
+  createContext,
   isValidElement,
   memo,
+  useContext,
   useState,
   useEffect,
   useLayoutEffect,
@@ -1394,12 +1396,18 @@ const ChatAttachmentThumbnail = memo(function ChatAttachmentThumbnail(
       ) : (
         <div className="flex h-full w-full min-w-0 items-center justify-center gap-2 p-3 text-[12px] leading-4 text-kumo-subtle">
           <FileIcon size={20} className="shrink-0 text-kumo-inactive" />
-          <span className="min-w-0 truncate">{attachment.name ?? "Attached file"}</span>
+          <span className="min-w-0 truncate">
+            {attachment.name ?? (isImage ? `Image (${formatAttachmentSize(attachment.size)})` : "Attached file")}
+          </span>
         </div>
       )}
     </button>
   );
 });
+
+/** Fetches the bytes of a chat attachment that arrived without them (images over 1 MiB). */
+const ChatAttachmentLoaderContext =
+  createContext<((id: string) => Promise<Uint8Array>) | null>(null);
 
 type ChatAttachmentGridProps = {
   attachments: ChatAttachmentRef[];
@@ -1412,12 +1420,33 @@ const ChatAttachmentGrid = memo(function ChatAttachmentGrid(
     onDownload,
   }: ChatAttachmentGridProps,
 ) {
-  const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
-  const previewAttachment = previewAttachmentId === null
-    ? null
-    : attachments.find((attachment) => attachment.id === previewAttachmentId) ?? null;
-  const handlePreview = useCallback((id: string) => setPreviewAttachmentId(id), []);
-  const handleClose = useCallback(() => setPreviewAttachmentId(null), []);
+  const loadAttachment = useContext(ChatAttachmentLoaderContext);
+  const [previewAttachment, setPreviewAttachment] = useState<ChatAttachmentRef | null>(null);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
+  // Each preview request supersedes the last, so a slow load cannot reopen a closed or replaced
+  // preview when it finally arrives.
+  const requestRef = useRef(0);
+  const handlePreview = useCallback(async (id: string) => {
+    let attachment = attachments.find((candidate) => candidate.id === id);
+    if (!attachment) return;
+    const request = ++requestRef.current;
+    if (attachment.mimeType.startsWith("image/") && !attachment.content && loadAttachment) {
+      setLoadingId(id);
+      try {
+        attachment = {...attachment, content: await loadAttachment(id)};
+      } catch {
+        // The modal's non-previewable card offers the download instead.
+      } finally {
+        if (requestRef.current === request) setLoadingId(null);
+      }
+      if (requestRef.current !== request) return;
+    }
+    setPreviewAttachment(attachment);
+  }, [attachments, loadAttachment]);
+  const handleClose = useCallback(() => {
+    requestRef.current++;
+    setPreviewAttachment(null);
+  }, []);
 
   return (
     <>
@@ -1430,6 +1459,9 @@ const ChatAttachmentGrid = memo(function ChatAttachmentGrid(
           />
         ))}
       </div>
+      {loadingId !== null && (
+        <p role="status" className="mb-2 text-[12px] text-kumo-subtle">Loading image…</p>
+      )}
       <AttachmentPreviewModal
         attachment={previewAttachment}
         onClose={handleClose}
@@ -3110,6 +3142,11 @@ function ChatInterface({
       toasts.add({ title: err?.message || "Failed to download attachment", variant: "error" });
     }
   }, [overseer, toasts]);
+
+  const loadChatAttachment = useCallback((id: string) => {
+    if (selectedChatId === null) return Promise.reject(new Error("No conversation selected."));
+    return overseer.getChatAttachmentContent(selectedChatId, id);
+  }, [overseer, selectedChatId]);
 
   const onSelectedChatProposedChangesChangeRef = useRef(onSelectedChatProposedChangesChange);
   onSelectedChatProposedChangesChangeRef.current = onSelectedChatProposedChangesChange;
@@ -5317,6 +5354,7 @@ function ChatInterface({
 
   // ─── main render ─────────────────────────────────────────────────────────────
   return (
+    <ChatAttachmentLoaderContext value={loadChatAttachment}>
     <div
       className={`flex h-full bg-kumo-base ${sidebarMode ? "flex-row" : "flex-col"}`}
     >
@@ -6475,6 +6513,7 @@ function ChatInterface({
         onClose={() => setUsageModalOpen(false)}
       />
     </div>
+    </ChatAttachmentLoaderContext>
   );
 }
 
